@@ -311,6 +311,63 @@ ${perf.trades.slice(-5).map(t => `${t.result === 'WIN' ? '✅' : '❌'} ${t.sign
 ⚡ _Apex Signal Bot — Daily Report_`;
 }
 
+// ─── OPEN TRADES TRACKER ─────────────────────────────────────────────────────
+const openTrades = [];
+
+async function checkOpenTrades(symbol, high, low) {
+  const sessionKey = getSessionKey(symbol);
+  const assetLabel = getAssetLabel(symbol);
+  const toRemove = [];
+
+  for (let i = 0; i < openTrades.length; i++) {
+    const trade = openTrades[i];
+    if (trade.symbol !== symbol) continue;
+    let result = null;
+    if (trade.signal === 'BUY') {
+      if (high >= trade.tp) result = 'WIN';
+      else if (low <= trade.sl) result = 'LOSS';
+    } else {
+      if (low <= trade.tp) result = 'WIN';
+      else if (high >= trade.sl) result = 'LOSS';
+    }
+    if (result) {
+      toRemove.push(i);
+      const pnl = result === 'WIN' ? Math.abs(trade.tp - trade.entry) : -Math.abs(trade.sl - trade.entry);
+      const emoji = result === 'WIN' ? '✅' : '❌';
+      const sd = sessionKey ? sessionData[sessionKey] : null;
+      if (sd) {
+        if (result === 'WIN') {
+          sd.performance.wins++;
+          sd.performance.currentStreakType === 'WIN' ? sd.performance.streak++ : (sd.performance.streak = 1, sd.performance.currentStreakType = 'WIN');
+          if (sd.performance.streak > sd.performance.bestStreak) sd.performance.bestStreak = sd.performance.streak;
+        } else {
+          sd.performance.losses++;
+          sd.performance.currentStreakType === 'LOSS' ? sd.performance.streak++ : (sd.performance.streak = 1, sd.performance.currentStreakType = 'LOSS');
+          if (sd.performance.streak > sd.performance.worstStreak) sd.performance.worstStreak = sd.performance.streak;
+        }
+        sd.performance.trades.push({ signal: trade.signal, entry: trade.entry, sl: trade.sl, tp: trade.tp, result, pnl, time: getBerlinTime() });
+      }
+      const total = sd ? sd.performance.wins + sd.performance.losses : 0;
+      const winRate = total > 0 ? ((sd.performance.wins / total) * 100).toFixed(1) : '0';
+      const msg = `${emoji} *TRADE ${result}* — ${assetLabel}
+
+${trade.signal === 'BUY' ? '📈' : '📉'} *${trade.signal}* Trade geschlossen
+💰 Entry: \`${trade.entry}\`
+${result === 'WIN' ? `🎯 TP erreicht: \`${trade.tp}\`` : `🛑 SL erreicht: \`${trade.sl}\``}
+💵 PnL: \`${pnl > 0 ? '+' : ''}${pnl.toFixed(2)} pts\`
+
+🔥 Serie: \`${sd?.performance.streak || 0}x ${sd?.performance.currentStreakType || '-'}\`
+📊 Heute: \`${sd?.performance.wins || 0}W / ${sd?.performance.losses || 0}L\` | Win-Rate: \`${winRate}%\`
+
+🕐 _${getBerlinTime()}_
+⚡ _Apex Signal Bot_`;
+      await sendTelegram(msg);
+      console.log(`${emoji} Trade ${result}: ${trade.signal} ${assetLabel} PnL: ${pnl.toFixed(2)}`);
+    }
+  }
+  for (let i = toRemove.length - 1; i >= 0; i--) openTrades.splice(toRemove[i], 1);
+}
+
 // ─── STORE ───────────────────────────────────────────────────────────────────
 const store = {
   'XAUUSD': { closes: [], highs: [], lows: [], lastSignal: null },
@@ -381,6 +438,9 @@ const server = http.createServer(async (req, res) => {
         st.closes.push(close); st.highs.push(high); st.lows.push(low);
         if (st.closes.length > 300) { st.closes.shift(); st.highs.shift(); st.lows.shift(); }
 
+        // 0. Offene Trades checken ob TP/SL erreicht
+        await checkOpenTrades(symbol, high, low);
+
         const sessionKey = getSessionKey(symbol);
         const assetLabel = getAssetLabel(symbol);
         const sd = sessionKey ? sessionData[sessionKey] : null;
@@ -419,6 +479,8 @@ const server = http.createServer(async (req, res) => {
               const rr = breakout === 'BUY' ? ((tp - close) / (close - sl)).toFixed(2) : ((close - tp) / (sl - close)).toFixed(2);
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               await sendTelegram(buildOpeningRangeSignalMsg(breakout, assetLabel, close.toFixed(2), sl, tp, rr, sd.lastBias, trend15m));
+              // Trade registrieren für Auto-Track
+              openTrades.push({ symbol, signal: breakout, entry: close, sl, tp, rr, type: 'opening_range', time: getBerlinTime() });
               console.log(`🟣 Opening Range Breakout: ${breakout} ${assetLabel}`);
             }
           }
@@ -441,6 +503,8 @@ const server = http.createServer(async (req, res) => {
             const bias = sd?.lastBias || null;
             const msg = buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp, result.rr, result.rsi, result.macd, bias, trend15m);
             const tgRes = await sendTelegram(msg);
+            // Trade registrieren für Auto-Track
+            openTrades.push({ symbol, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp, rr: result.rr, type: '4confirm', time: getBerlinTime() });
             console.log(`${result.signal === 'BUY' ? '🟢' : '🔴'} Signal: ${result.signal} ${assetLabel} | Telegram: ${tgRes.ok ? '✅' : '❌'}`);
             res.writeHead(200); return res.end(JSON.stringify({ ok: true, signal: result.signal }));
           }
