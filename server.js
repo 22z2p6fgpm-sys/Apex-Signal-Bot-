@@ -132,6 +132,7 @@ function berlinMinutesOfDay() { const { hour, min } = berlinParts(); return hour
 
 // Zeitfenster (in Minuten seit Mitternacht)
 const T = {
+  MORNING: 8 * 60,          // 08:00 — Guten Morgen / Bot aktiv
   ASIA_START: 2 * 60,       // 02:00
   ASIA_END: 9 * 60,         // 09:00
   LONDON_END: 15 * 60 + 30, // 15:30
@@ -154,6 +155,16 @@ function freshSession() {
   };
 }
 const sessionData = { 'XAUUSD': freshSession(), 'NDX': freshSession() };
+
+// Globaler Tages-Tracker für Nachrichten die nur EINMAL pro Tag kommen (nicht pro Symbol)
+const dailyFlags = { date: null, morningSent: false };
+function resetDailyFlagsIfNeeded() {
+  const today = getBerlinDate();
+  if (dailyFlags.date !== today) {
+    dailyFlags.date = today;
+    dailyFlags.morningSent = false;
+  }
+}
 
 function resetDayIfNeeded(sd) {
   const today = getBerlinDate();
@@ -325,6 +336,24 @@ function biasTag(bias, signal) {
 function tf15Tag(trend15m, signal) {
   if (!trend15m) return '• 15M Trend: neutral';
   return trend15m === signal ? '• ✅ 15M Trend bestätigt' : '• ⚠️ Gegen 15M Trend';
+}
+
+function buildMorningMsg() {
+  return `☀️ *GUTEN MORGEN!*
+
+✅ Apex Signal Bot ist *aktiv* und überwacht die Märkte.
+🗓 ${getBerlinDate()}
+
+📡 *Heute im Blick:*
+• XAU/USD (Gold) — Scalp & Swing
+• NASDAQ 100 — Scalp & Swing
+
+🔵 Daily Bias kommt um *15:30*
+🟣 Opening Range um *15:45*
+📊 Tages-Report um *22:00*
+
+_Auf einen profitablen Tag!_ 💪
+⚡ _Apex Signal Bot_`;
 }
 
 function buildBiasMsg(asset, bias, reason, asiaHigh, asiaLow) {
@@ -543,6 +572,14 @@ const server = http.createServer((req, res) => {
         // Kerzen speichern
         st.closes.push(close); st.highs.push(high); st.lows.push(low);
         if (st.closes.length > CONFIG.MAX_CANDLES) { st.closes.shift(); st.highs.shift(); st.lows.shift(); }
+
+        // Morgennachricht (08:00) — nur EINMAL pro Tag, egal welches Symbol triggert
+        resetDailyFlagsIfNeeded();
+        if (berlinMinutesOfDay() >= T.MORNING && !dailyFlags.morningSent) {
+          dailyFlags.morningSent = true;
+          await sendTelegram(buildMorningMsg());
+          console.log('☀️ Morgennachricht gesendet');
+        }
 
         // 0. Offene Trades prüfen (TP/SL/Timeout)
         await checkOpenTrades(normSym, high, low);
