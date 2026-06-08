@@ -17,10 +17,17 @@ const CONFIG = {
   TRADE_TIMEOUT_MIN: 240, // Trade nach 4h schließen wenn weder TP noch SL
   RSI_BUY: [45, 65],
   RSI_SELL: [35, 55],
-  // Swing Trades (1H Timeframe, Stunden bis 1 Tag)
+  // Qualitäts-Filter (smarter statt nur strenger)
+  COOLDOWN_MIN: 15,        // Nach einem Trade X Min Pause pro Symbol (kein Doppel-Feuern)
+  MIN_ATR_PERCENT: 0.04,   // Mindest-Bewegung: ATR muss >= 0.04% vom Preis sein (kein toter Markt)
+  REQUIRE_BIAS_ALIGN: true, // Scalp nur in Richtung des Daily Bias (wenn Bias gesetzt)
+  // Swing Trades (1H Timeframe) — eigenes Trend-Following-Setup mit Pullback
   SWING_SL_MULT: 2,        // weiterer Stop Loss = 2 × ATR
   SWING_TP_MULT: 4,        // weiteres Take Profit = 4 × ATR
   SWING_TIMEOUT_MIN: 1440, // 24h Timeout
+  SWING_EMA_FAST: 50,      // Trend-Definition: schnelle EMA
+  SWING_EMA_SLOW: 200,     // Trend-Definition: langsame EMA
+  SWING_PULLBACK_EMA: 20,  // Einstieg beim Pullback zur EMA20
 };
 
 // ─── MATH HELPERS ─────────────────────────────────────────────────────────────
@@ -99,6 +106,10 @@ function runStrategy(closes, highs, lows, slMult = CONFIG.SL_MULT, tpMult = CONF
 
   const atrV = atrCalc(closes, highs, lows) || cur * 0.005;
 
+  // Qualitäts-Filter: Markt muss sich genug bewegen (kein totes Seitwärts-Gezappel)
+  const atrPercent = (atrV / cur) * 100;
+  if (atrPercent < CONFIG.MIN_ATR_PERCENT) return null;
+
   const buyS = crossUp && rsiBuy && mBull && cur > s50;
   const sellS = crossDown && rsiSell && mBear && cur < s50;
   if (!buyS && !sellS) return null;
@@ -116,6 +127,51 @@ function runStrategy(closes, highs, lows, slMult = CONFIG.SL_MULT, tpMult = CONF
     rr,
     rsi: rv.toFixed(1),
     macd: mn.toFixed(3),
+  };
+}
+
+// ─── SWING-STRATEGIE: Trend-Following mit Pullback (1H) ────────────────────────
+// Anders als der Scalp: wartet auf etablierten Trend + günstigen Pullback-Einstieg
+function runSwingStrategy(closes, highs, lows) {
+  const need = CONFIG.SWING_EMA_SLOW + 5;
+  if (closes.length < need) return null; // braucht genug Historie für EMA200
+
+  const cur = closes[closes.length - 1];
+  const emaFast = ema(closes, CONFIG.SWING_EMA_FAST);   // EMA 50
+  const emaSlow = ema(closes, CONFIG.SWING_EMA_SLOW);   // EMA 200
+  const emaPull = ema(closes, CONFIG.SWING_PULLBACK_EMA); // EMA 20
+  if ([emaFast, emaSlow, emaPull].some(v => v === null)) return null;
+
+  const rv = rsiCalc(closes);
+  if (rv === null) return null;
+
+  const atrV = atrCalc(closes, highs, lows) || cur * 0.005;
+
+  // Trend-Definition: EMA50 vs EMA200
+  const uptrend = emaFast > emaSlow;
+  const downtrend = emaFast < emaSlow;
+
+  // Pullback: Preis ist nah an der EMA20 zurückgekommen (innerhalb 0.5×ATR)
+  const nearPullback = Math.abs(cur - emaPull) <= atrV * 0.5;
+
+  // Einstieg: Trend + Pullback + RSI bestätigt Momentum-Richtung
+  const buy = uptrend && nearPullback && cur > emaPull && rv > 45 && rv < 70;
+  const sell = downtrend && nearPullback && cur < emaPull && rv < 55 && rv > 30;
+  if (!buy && !sell) return null;
+
+  const signal = buy ? 'BUY' : 'SELL';
+  const sl = buy ? cur - atrV * CONFIG.SWING_SL_MULT : cur + atrV * CONFIG.SWING_SL_MULT;
+  const tp = buy ? cur + atrV * CONFIG.SWING_TP_MULT : cur - atrV * CONFIG.SWING_TP_MULT;
+  const rr = (CONFIG.SWING_TP_MULT / CONFIG.SWING_SL_MULT).toFixed(2);
+
+  return {
+    signal,
+    cur: parseFloat(cur.toFixed(2)),
+    sl: parseFloat(sl.toFixed(2)),
+    tp: parseFloat(tp.toFixed(2)),
+    rr,
+    rsi: rv.toFixed(1),
+    trend: uptrend ? 'Aufwärtstrend' : 'Abwärtstrend',
   };
 }
 
@@ -241,8 +297,17 @@ function recordTrade(sd, trade, result, pnl) {
 // Pro Symbol max. 1 offener Trade gleichzeitig → kein Durcheinander
 const openTrades = []; // { symbol, signal, entry, sl, tp, rr, type, openedAt(ms) }
 
+// Cooldown: Zeitpunkt des letzten Trades pro Symbol (verhindert Doppel-Feuern)
+const lastTradeTime = {}; // normSym -> ms
+
 function hasOpenTrade(symbol) {
   return openTrades.some(t => t.symbol === symbol);
+}
+
+function inCooldown(normSym) {
+  const last = lastTradeTime[normSym];
+  if (!last) return false;
+  return (Date.now() - last) < CONFIG.COOLDOWN_MIN * 60 * 1000;
 }
 
 async function checkOpenTrades(symbol, high, low) {
@@ -420,21 +485,22 @@ ${tf15Tag(trend15m, signal)}
 ⚡ _Apex Signal Bot — Conservative Scalp_`;
 }
 
-function buildSwingSignalMsg(signal, asset, entry, sl, tp, rr, rsi, macd) {
+function buildSwingSignalMsg(signal, asset, entry, sl, tp, rr, rsi, trend) {
   const dir = signal === 'BUY' ? '📈' : '📉';
   return `🟠 *SWING ${signal}* — ${asset} ${dir}
 
 ⏳ _Haltedauer: Stunden bis 1 Tag · 1H Chart_
+📐 _Setup: Trend-Following + Pullback_
 
 💰 *Entry:*       \`${entry.toFixed(2)}\`
 🛑 *Stop Loss:*   \`${sl.toFixed(2)}\`
 🎯 *Take Profit:* \`${tp.toFixed(2)}\`
 ⚖️ *Risk/Reward:* \`1 : ${rr}\`
 
-📊 *Indikatoren (1H):*
+📊 *Analyse (1H):*
+• Trend: \`${trend}\`
 • RSI 14: \`${rsi}\`
-• MACD: \`${macd}\`
-• Alle 4 bestätigt ✅
+• Pullback zur EMA20 ✅
 
 🕐 _${getBerlinTime()} — ${getBerlinDate()}_
 ⚡ _Apex Signal Bot — Swing Trade_`;
@@ -533,10 +599,11 @@ const server = http.createServer((req, res) => {
       `Opening Range: H ${sd.openingRange.high ?? '-'} / L ${sd.openingRange.low ?? '-'}`,
       `Performance heute: ${sd.performance.wins}W / ${sd.performance.losses}L`,
       '',
-      '── Swing (1H) ──',
-      `XAU/USD Swing-Kerzen: ${swingStore['XAUUSD'].closes.length}`,
-      `NDX Swing-Kerzen:     ${swingStore['NDX'].closes.length}`,
+      '── Swing (1H) — braucht 205 Kerzen für EMA200 ──',
+      `XAU/USD Swing-Kerzen: ${swingStore['XAUUSD'].closes.length} ${swingStore['XAUUSD'].closes.length >= 205 ? '✅' : '(sammelt...)'}`,
+      `NDX Swing-Kerzen:     ${swingStore['NDX'].closes.length} ${swingStore['NDX'].closes.length >= 205 ? '✅' : '(sammelt...)'}`,
       '',
+      `Scalp: 5M · Cooldown ${CONFIG.COOLDOWN_MIN}min · Bias-Filter ${CONFIG.REQUIRE_BIAS_ALIGN ? 'an' : 'aus'}`,
       `Token gesetzt: ${TOKEN ? 'ja' : 'NEIN ⚠️'}`,
     ].join('\n'));
   }
@@ -584,17 +651,18 @@ const server = http.createServer((req, res) => {
         // 0. Offene Trades prüfen (TP/SL/Timeout)
         await checkOpenTrades(normSym, high, low);
 
-        // ─── SWING TRADES (1H) — eigener Pfad, ohne Session/Bias/Opening-Range ───
+        // ─── SWING TRADES (1H) — Trend-Following + Pullback, eigenes Setup ───
         if (isSwing(symbol)) {
-          if (!hasOpenTrade(normSym)) {
-            const sw = runStrategy(st.closes, st.highs, st.lows, CONFIG.SWING_SL_MULT, CONFIG.SWING_TP_MULT);
+          if (!hasOpenTrade(normSym) && !inCooldown(normSym)) {
+            const sw = runSwingStrategy(st.closes, st.highs, st.lows);
             if (sw) {
               const signalKey = `${sw.signal}-${Math.round(sw.cur)}`;
               if (st.lastSignal !== signalKey) {
                 st.lastSignal = signalKey;
-                await sendTelegram(buildSwingSignalMsg(sw.signal, assetLabel, sw.cur, sw.sl, sw.tp, sw.rr, sw.rsi, sw.macd));
+                await sendTelegram(buildSwingSignalMsg(sw.signal, assetLabel, sw.cur, sw.sl, sw.tp, sw.rr, sw.rsi, sw.trend));
                 openTrades.push({ symbol: normSym, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp, rr: sw.rr, type: 'swing', timeoutMin: CONFIG.SWING_TIMEOUT_MIN, openedAt: Date.now() });
-                console.log(`🟠 Swing: ${sw.signal} ${assetLabel}`);
+                lastTradeTime[normSym] = Date.now();
+                console.log(`🟠 Swing: ${sw.signal} ${assetLabel} (${sw.trend})`);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 return res.end(JSON.stringify({ ok: true, signal: sw.signal, type: 'swing', entry: sw.cur }));
               }
@@ -651,20 +719,28 @@ const server = http.createServer((req, res) => {
           }
         }
 
-        // 5. 4-Confirm Signal — nur wenn kein offener Trade auf dem Symbol
-        if (!hasOpenTrade(normSym)) {
+        // 5. 4-Confirm Signal — nur wenn kein offener Trade UND kein Cooldown aktiv
+        if (!hasOpenTrade(normSym) && !inCooldown(normSym)) {
           const result = runStrategy(st.closes, st.highs, st.lows);
           if (result) {
+            const bias = sd?.lastBias || null;
+            // Bias-Filter: nur Trades in Richtung des Daily Bias (wenn Bias gesetzt & aktiv)
+            const biasBlocks = CONFIG.REQUIRE_BIAS_ALIGN
+              && bias && bias !== 'WATCH' && bias !== 'NEUTRAL'
+              && bias !== result.signal;
+
             const signalKey = `${result.signal}-${Math.round(result.cur)}`;
-            if (st.lastSignal !== signalKey) {
+            if (!biasBlocks && st.lastSignal !== signalKey) {
               st.lastSignal = signalKey;
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
-              const bias = sd?.lastBias || null;
               await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp, result.rr, result.rsi, result.macd, bias, trend15m));
               openTrades.push({ symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp, rr: result.rr, type: '4confirm', openedAt: Date.now() });
+              lastTradeTime[normSym] = Date.now();
               console.log(`${result.signal === 'BUY' ? '🟢' : '🔴'} Signal: ${result.signal} ${assetLabel}`);
               res.writeHead(200, { 'Content-Type': 'application/json' });
               return res.end(JSON.stringify({ ok: true, signal: result.signal, entry: result.cur }));
+            } else if (biasBlocks) {
+              console.log(`⏸ ${result.signal} ${assetLabel} blockiert (gegen Bias ${bias})`);
             }
           }
         }
