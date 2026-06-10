@@ -35,6 +35,13 @@ const CONFIG = {
   ASIA_RSI_BUY: [50, 62],   // engeres RSI-Fenster in Asia (nur klarere Signale)
   ASIA_RSI_SELL: [38, 50],
 
+  // ── Abend-Filter (ab 19:00 Berlin) — späte US-Session wird oft choppy, viele Losses ──
+  EVENING_START_MIN: 19 * 60, // 19:00
+  EVENING_END_MIN: 23 * 60,   // 23:00 (danach greift eh die ruhige Nacht)
+  EVENING_MIN_ATR_PERCENT: 0.08, // nur noch starke Bewegungen abends
+  EVENING_RSI_BUY: [52, 62],  // sehr enges RSI-Fenster abends
+  EVENING_RSI_SELL: [38, 48],
+
   // ── Swing (1H) ──
   SWING_SL_MULT: 2,
   SWING_TP1_MULT: 2.0,
@@ -45,6 +52,39 @@ const CONFIG = {
   SWING_EMA_SLOW: 200,
   SWING_PULLBACK_EMA: 20,
 };
+
+// ── Symbol-spezifische Filter-Überschreibungen ──
+// NASDAQ lief schlecht (43% Win-Rate, -52 Pips) → deutlich strenger filtern.
+// Gold läuft gut → moderate Multi-Timeframe-Checks.
+const SYMBOL_FILTERS = {
+  'NDX': {
+    minAtrPercent: 0.10,     // viel höhere Mindest-Bewegung (NASDAQ ist volatil — nur starke Moves)
+    rsiBuy: [50, 62],        // engeres RSI-Fenster → nur klarere Momentum-Signale
+    rsiSell: [38, 50],
+    cooldownMin: 30,         // längere Pause zwischen Trades (weniger Overtrading)
+    requireBiasAlign: true,  // strikt nur in Bias-Richtung
+    require15mAlign: true,   // nur wenn 15M-Trend übereinstimmt
+    require4hAlign: true,    // 4H-Trend muss übereinstimmen (Multi-TF Bias)
+    require5mAlign: true,    // 5M-Entry-Momentum muss passen
+    requireBOS: false,       // Break of Structure optional (kann zu streng sein)
+    requireLiquidity: true,  // nur traden wenn Liquidität in Trade-Richtung liegt
+  },
+  'XAUUSD': {
+    minAtrPercent: CONFIG.MIN_ATR_PERCENT,
+    rsiBuy: CONFIG.RSI_BUY,
+    rsiSell: CONFIG.RSI_SELL,
+    cooldownMin: CONFIG.COOLDOWN_MIN,
+    requireBiasAlign: CONFIG.REQUIRE_BIAS_ALIGN,
+    require15mAlign: false,
+    require4hAlign: true,    // 4H-Trend muss übereinstimmen (Multi-TF Bias)
+    require5mAlign: true,    // 5M-Entry-Momentum muss passen
+    requireBOS: false,       // Break of Structure optional
+    requireLiquidity: true,  // nur traden wenn Liquidität in Trade-Richtung liegt
+  },
+};
+function getFilters(sessionKey) {
+  return SYMBOL_FILTERS[sessionKey] || SYMBOL_FILTERS['XAUUSD'];
+}
 
 // ── Pip- & Geldwert-Definitionen pro Symbol ──
 // Gold: 1 Pip = 0.1 Preis-Einheiten. NASDAQ: 1 Pip = 1 Punkt.
@@ -101,8 +141,11 @@ function atrCalc(closes, highs, lows, n = 14) {
 
 // ─── MULTI-TIMEFRAME (1M → 15M) ────────────────────────────────────────────────
 function aggregateTo15M(closes, highs, lows) {
+  return aggregateTF(closes, highs, lows, 15);
+}
+// Generische Aggregation: fasst N 1M-Kerzen zu einer größeren Kerze zusammen
+function aggregateTF(closes, highs, lows, size) {
   const out = { closes: [], highs: [], lows: [] };
-  const size = 15;
   for (let i = 0; i + size <= closes.length; i += size) {
     out.closes.push(closes[i + size - 1]);
     out.highs.push(Math.max(...highs.slice(i, i + size)));
@@ -117,16 +160,72 @@ function get15MTrend(closes, highs, lows) {
   if (e12 === null || e26 === null) return null;
   return e12 > e26 ? 'BUY' : 'SELL';
 }
+// Trend auf beliebigem Timeframe (size = Anzahl 1M-Kerzen pro Kerze)
+function getTrendOnTF(closes, highs, lows, size) {
+  const tf = aggregateTF(closes, highs, lows, size);
+  if (tf.closes.length < 26) return null;
+  const e12 = ema(tf.closes, 12), e26 = ema(tf.closes, 26);
+  if (e12 === null || e26 === null) return null;
+  return e12 > e26 ? 'BUY' : 'SELL';
+}
+// 5M-Entry-Bestätigung: kurzfristiges Momentum über EMA9 vs EMA21
+function get5MTrend(closes, highs, lows) {
+  const tf = aggregateTF(closes, highs, lows, 5);
+  if (tf.closes.length < 21) return null;
+  const e9 = ema(tf.closes, 9), e21 = ema(tf.closes, 21);
+  if (e9 === null || e21 === null) return null;
+  return e9 > e21 ? 'BUY' : 'SELL';
+}
+
+// ─── LIQUIDITÄT (1H Swing-Highs/Lows als Annäherung) ──────────────────────────
+// Findet markante Hochs/Tiefs auf dem 1H-Chart. Liquidität liegt typischerweise
+// über letzten Hochs (Short-Stops) und unter letzten Tiefs (Long-Stops).
+function findLiquidity(closes, highs, lows) {
+  const h1 = aggregateTF(closes, highs, lows, 60); // 60 × 1M = 1H
+  if (h1.closes.length < 10) return null;
+  const cur = closes[closes.length - 1];
+  const lookback = Math.min(20, h1.highs.length); // letzte ~20 Stunden
+  const recentHighs = h1.highs.slice(-lookback);
+  const recentLows = h1.lows.slice(-lookback);
+
+  // Nächstes Hoch ÜBER dem aktuellen Preis = Liquidität oben (Long-Ziel)
+  const liqAbove = recentHighs.filter(h => h > cur).sort((a, b) => a - b)[0] || null;
+  // Nächstes Tief UNTER dem aktuellen Preis = Liquidität unten (Short-Ziel)
+  const liqBelow = recentLows.filter(l => l < cur).sort((a, b) => b - a)[0] || null;
+
+  return { liqAbove, liqBelow, cur };
+}
+
+// ─── BREAK OF STRUCTURE (vereinfacht) ─────────────────────────────────────────
+// Prüft ob der Preis das letzte markante Hoch (bullish BOS) oder Tief (bearish BOS)
+// auf dem 15M-Chart gebrochen hat. Anerkanntes Konzept, hier regelbasiert.
+function breakOfStructure(closes, highs, lows) {
+  const tf = aggregateTF(closes, highs, lows, 15);
+  if (tf.closes.length < 8) return null;
+  const cur = tf.closes[tf.closes.length - 1];
+  // Letzte 6 Kerzen OHNE die aktuelle betrachten
+  const prevHighs = tf.highs.slice(-7, -1);
+  const prevLows = tf.lows.slice(-7, -1);
+  const lastSwingHigh = Math.max(...prevHighs);
+  const lastSwingLow = Math.min(...prevLows);
+  if (cur > lastSwingHigh) return 'BUY';  // bullish Break of Structure
+  if (cur < lastSwingLow) return 'SELL';  // bearish Break of Structure
+  return null; // keine Struktur gebrochen
+}
 
 // ─── STRATEGIE: 4-Confirm Conservative Scalp ───────────────────────────────────
-function runStrategy(closes, highs, lows) {
+function runStrategy(closes, highs, lows, sessionKey) {
   if (closes.length < 70) return null;
   const cur = closes[closes.length - 1];
   const prev = closes.slice(0, -1);
 
+  const filt = getFilters(sessionKey);
+
   // Ist gerade Asia-Session? Dann strengere Filter anwenden
   const tNow = berlinMinutesOfDay();
   const isAsia = tNow >= CONFIG.ASIA_START_MIN && tNow < CONFIG.ASIA_END_MIN;
+  // Ist gerade Abend (späte US-Session)? Dann ebenfalls strenger
+  const isEvening = tNow >= CONFIG.EVENING_START_MIN && tNow < CONFIG.EVENING_END_MIN;
 
   const e12n = ema(closes, 12), e26n = ema(closes, 26);
   const e12p = ema(prev, 12), e26p = ema(prev, 26);
@@ -137,9 +236,10 @@ function runStrategy(closes, highs, lows) {
 
   const rv = rsiCalc(closes);
   if (rv === null) return null;
-  // In Asia: engeres RSI-Fenster (nur klarere Signale)
-  const rsiBuyRange = isAsia ? CONFIG.ASIA_RSI_BUY : CONFIG.RSI_BUY;
-  const rsiSellRange = isAsia ? CONFIG.ASIA_RSI_SELL : CONFIG.RSI_SELL;
+  // RSI-Fenster: Asia/Abend am strengsten, sonst symbol-spezifisch
+  let rsiBuyRange = filt.rsiBuy, rsiSellRange = filt.rsiSell;
+  if (isAsia) { rsiBuyRange = CONFIG.ASIA_RSI_BUY; rsiSellRange = CONFIG.ASIA_RSI_SELL; }
+  else if (isEvening) { rsiBuyRange = CONFIG.EVENING_RSI_BUY; rsiSellRange = CONFIG.EVENING_RSI_SELL; }
   const rsiBuy = rv >= rsiBuyRange[0] && rv <= rsiBuyRange[1];
   const rsiSell = rv >= rsiSellRange[0] && rv <= rsiSellRange[1];
 
@@ -153,9 +253,11 @@ function runStrategy(closes, highs, lows) {
 
   const atrV = atrCalc(closes, highs, lows) || cur * 0.005;
 
-  // Qualitäts-Filter: Markt muss sich genug bewegen. In Asia höhere Schwelle.
+  // ATR-Filter: Asia/Abend am strengsten, sonst symbol-spezifisch
   const atrPercent = (atrV / cur) * 100;
-  const minAtr = isAsia ? CONFIG.ASIA_MIN_ATR_PERCENT : CONFIG.MIN_ATR_PERCENT;
+  let minAtr = filt.minAtrPercent;
+  if (isAsia) minAtr = Math.max(CONFIG.ASIA_MIN_ATR_PERCENT, filt.minAtrPercent);
+  else if (isEvening) minAtr = Math.max(CONFIG.EVENING_MIN_ATR_PERCENT, filt.minAtrPercent);
   if (atrPercent < minAtr) return null;
 
   const buyS = crossUp && rsiBuy && mBull && cur > s50;
@@ -163,6 +265,41 @@ function runStrategy(closes, highs, lows) {
   if (!buyS && !sellS) return null;
 
   const signal = buyS ? 'BUY' : 'SELL';
+
+  // ── Multi-Timeframe-Filter (aus dem Profi-Konzept: Bias → Liquidität → Entry) ──
+
+  // 15M-Trend (Entry-Ebene, optional)
+  if (filt.require15mAlign) {
+    const t15 = get15MTrend(closes, highs, lows);
+    if (t15 && t15 !== signal) return null;
+  }
+  // 4H-Trend (Bias-Ebene): großer Trend muss zur Signal-Richtung passen
+  if (filt.require4hAlign) {
+    const t4h = getTrendOnTF(closes, highs, lows, 240); // 240 × 1M = 4H
+    if (t4h && t4h !== signal) return null;
+  }
+  // 5M-Momentum (Entry-Ebene): kurzfristiges Momentum muss passen
+  if (filt.require5mAlign) {
+    const t5 = get5MTrend(closes, highs, lows);
+    if (t5 && t5 !== signal) return null;
+  }
+  // Break of Structure (15M): nur traden wenn Struktur in Signal-Richtung gebrochen
+  if (filt.requireBOS) {
+    const bos = breakOfStructure(closes, highs, lows);
+    if (bos && bos !== signal) return null;
+  }
+  // Liquidität (1H Swing-Punkte): nur traden wenn "Ziel-Liquidität" in Trade-Richtung liegt
+  let liqInfo = null;
+  if (filt.requireLiquidity) {
+    const liq = findLiquidity(closes, highs, lows);
+    if (liq) {
+      liqInfo = liq;
+      // BUY braucht Liquidität oben (liqAbove), SELL braucht Liquidität unten (liqBelow)
+      if (signal === 'BUY' && liq.liqAbove === null) return null;
+      if (signal === 'SELL' && liq.liqBelow === null) return null;
+    }
+  }
+
   const dir = buyS ? 1 : -1;
   const sl = parseFloat((cur - dir * atrV * CONFIG.SL_MULT).toFixed(2));
   const tp1 = parseFloat((cur + dir * atrV * CONFIG.TP1_MULT).toFixed(2));
@@ -170,12 +307,18 @@ function runStrategy(closes, highs, lows) {
   const tp3 = parseFloat((cur + dir * atrV * CONFIG.TP3_MULT).toFixed(2));
   const rr = (CONFIG.TP1_MULT / CONFIG.SL_MULT).toFixed(2);
 
+  // Liquiditäts-Ziel für die Nachricht (wohin der Markt "will")
+  const liqTarget = liqInfo
+    ? (signal === 'BUY' ? liqInfo.liqAbove : liqInfo.liqBelow)
+    : null;
+
   return {
     signal,
     cur: parseFloat(cur.toFixed(2)),
     sl, tp1, tp2, tp3, rr,
     rsi: rv.toFixed(1),
     macd: mn.toFixed(3),
+    liqTarget: liqTarget ? parseFloat(liqTarget.toFixed(2)) : null,
   };
 }
 
@@ -357,7 +500,9 @@ function hasOpenTrade(symbol) {
 function inCooldown(normSym) {
   const last = lastTradeTime[normSym];
   if (!last) return false;
-  return (Date.now() - last) < CONFIG.COOLDOWN_MIN * 60 * 1000;
+  const sessionKey = getSessionKey(normSym);
+  const cooldownMin = getFilters(sessionKey).cooldownMin || CONFIG.COOLDOWN_MIN;
+  return (Date.now() - last) < cooldownMin * 60 * 1000;
 }
 
 async function checkOpenTrades(symbol, high, low) {
@@ -588,9 +733,10 @@ function buildOpeningRangeSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr,
 ⚡ _Apex Signal Bot — Opening Range_`;
 }
 
-function buildSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, rsi, macd, bias, trend15m) {
+function buildSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, rsi, macd, bias, trend15m, liqTarget) {
   const emoji = signal === 'BUY' ? '🟢' : '🔴';
   const dir = signal === 'BUY' ? '📈' : '📉';
+  const liqLine = liqTarget ? `\n💧 *Liquiditäts-Ziel:* \`${liqTarget.toFixed(2)}\`` : '';
   return `${emoji} *${signal} NOW* — ${asset} ${dir}${biasTag(bias, signal)}
 
 💰 *Entry:*     \`${entry.toFixed(2)}\`
@@ -599,13 +745,13 @@ function buildSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, rsi, macd, 
 🎯 *TP1:* \`${tp1.toFixed(2)}\`  _(= WIN, sichern)_
 🎯 *TP2:* \`${tp2.toFixed(2)}\`  _(→ Break-Even)_
 🎯 *TP3:* \`${tp3.toFixed(2)}\`  _(Runner)_
-⚖️ *R:R (bis TP1):* \`1 : ${rr}\`
+⚖️ *R:R (bis TP1):* \`1 : ${rr}\`${liqLine}
 
 📊 *Indikatoren:*
 • RSI 14: \`${rsi}\`
 • MACD: \`${macd}\`
 ${tf15Tag(trend15m, signal)}
-• Alle 4 bestätigt ✅
+• Multi-Timeframe bestätigt ✅
 
 🕐 _${getBerlinTime()} — ${getBerlinDate()}_
 ⚡ _Apex Signal Bot — Conservative Scalp_`;
@@ -973,11 +1119,11 @@ const server = http.createServer((req, res) => {
 
         // 5. 4-Confirm Signal — nur wenn kein offener Trade UND kein Cooldown aktiv
         if (!hasOpenTrade(normSym) && !inCooldown(normSym)) {
-          const result = runStrategy(st.closes, st.highs, st.lows);
+          const result = runStrategy(st.closes, st.highs, st.lows, sessionKey);
           if (result) {
             const bias = sd?.lastBias || null;
-            // Bias-Filter: nur Trades in Richtung des Daily Bias (wenn Bias gesetzt & aktiv)
-            const biasBlocks = CONFIG.REQUIRE_BIAS_ALIGN
+            // Bias-Filter: nur Trades in Richtung des Daily Bias (symbol-spezifisch)
+            const biasBlocks = getFilters(sessionKey).requireBiasAlign
               && bias && bias !== 'WATCH' && bias !== 'NEUTRAL'
               && bias !== result.signal;
 
@@ -985,7 +1131,7 @@ const server = http.createServer((req, res) => {
             if (!biasBlocks && st.lastSignal !== signalKey) {
               st.lastSignal = signalKey;
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
-              await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp1, result.tp2, result.tp3, result.rr, result.rsi, result.macd, bias, trend15m));
+              await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp1, result.tp2, result.tp3, result.rr, result.rsi, result.macd, bias, trend15m, result.liqTarget));
               openTrades.push({ symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, type: '4confirm', openedAt: Date.now() });
               lastTradeTime[normSym] = Date.now();
               console.log(`${result.signal === 'BUY' ? '🟢' : '🔴'} Signal: ${result.signal} ${assetLabel}`);
