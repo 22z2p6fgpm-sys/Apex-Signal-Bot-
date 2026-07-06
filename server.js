@@ -1,22 +1,24 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  APEX SIGNAL BOT v3 — TradingView Webhook → Telegram
+//  APEX SIGNAL BOT v4 — TradingView Webhook → Telegram
 //  Strategien: 4-Confirm Scalp · Daily Bias · NYC Opening Range · Multi-TF
-//  Auto Win/Loss Tracking · Performance Report · Streak Tracker
+//  Swing (1H) wird aus dem 1M-Feed gebaut · Auto Win/Loss · Persistenz
 // ═══════════════════════════════════════════════════════════════════════════
 const https = require('https');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID || "-5280319758";
 
 // ─── KONFIGURATION ───────────────────────────────────────────────────────────
 const CONFIG = {
-  // ── SL/TP (× ATR) — verbessert: SL etwas enger, TP-Stufen sauber gestaffelt ──
-  SL_MULT: 1.3,        // Stop Loss = 1.3 × ATR (vorher 1.5 — etwas enger für besseres R:R)
-  TP1_MULT: 1.3,       // TP1 = 1.3 × ATR → R:R 1:1 bis TP1 (mind. so weit wie SL)
-  TP2_MULT: 2.6,       // TP2 = 2.6 × ATR
-  TP3_MULT: 4.0,       // TP3 = 4.0 × ATR (Runner)
-  BREAKEVEN_AFTER_TP2: true, // Nach TP2: SL auf Entry (Break-Even)
+  // ── SL/TP (× ATR) ──
+  SL_MULT: 1.3,
+  TP1_MULT: 1.3,
+  TP2_MULT: 2.6,
+  TP3_MULT: 4.0,
+  BREAKEVEN_AFTER_TP2: true,
 
   MAX_CANDLES: 300,
   TRADE_TIMEOUT_MIN: 240, // 4h
@@ -28,18 +30,18 @@ const CONFIG = {
   MIN_ATR_PERCENT: 0.04,
   REQUIRE_BIAS_ALIGN: true,
 
-  // ── Asia-Session-Filter (02:00–09:00 Berlin) — strenger, da dort viele Losses ──
-  ASIA_START_MIN: 2 * 60,   // 02:00
-  ASIA_END_MIN: 9 * 60,     // 09:00
-  ASIA_MIN_ATR_PERCENT: 0.07, // höhere Mindest-Bewegung in Asia (fast 2× normal)
-  ASIA_RSI_BUY: [50, 62],   // engeres RSI-Fenster in Asia (nur klarere Signale)
+  // ── Asia-Session-Filter (02:00–09:00 Berlin) ──
+  ASIA_START_MIN: 2 * 60,
+  ASIA_END_MIN: 9 * 60,
+  ASIA_MIN_ATR_PERCENT: 0.07,
+  ASIA_RSI_BUY: [50, 62],
   ASIA_RSI_SELL: [38, 50],
 
-  // ── Abend-Filter (ab 19:00 Berlin) — späte US-Session wird oft choppy, viele Losses ──
-  EVENING_START_MIN: 19 * 60, // 19:00
-  EVENING_END_MIN: 23 * 60,   // 23:00 (danach greift eh die ruhige Nacht)
-  EVENING_MIN_ATR_PERCENT: 0.08, // nur noch starke Bewegungen abends
-  EVENING_RSI_BUY: [52, 62],  // sehr enges RSI-Fenster abends
+  // ── Abend-Filter (ab 19:00 Berlin) ──
+  EVENING_START_MIN: 19 * 60,
+  EVENING_END_MIN: 23 * 60,
+  EVENING_MIN_ATR_PERCENT: 0.08,
+  EVENING_RSI_BUY: [52, 62],
   EVENING_RSI_SELL: [38, 48],
 
   // ── Swing (1H) ──
@@ -49,26 +51,24 @@ const CONFIG = {
   SWING_TP3_MULT: 6.0,
   SWING_TIMEOUT_MIN: 1440,
   SWING_EMA_FAST: 50,
-  SWING_EMA_SLOW: 200,
+  SWING_EMA_SLOW: 100,   // von 200 → 100: schnellerer Warmup (~1 Woche Marktzeit)
   SWING_PULLBACK_EMA: 20,
 };
 
 // ── Symbol-spezifische Filter-Überschreibungen ──
-// NASDAQ lief schlecht (43% Win-Rate, -52 Pips) → deutlich strenger filtern.
-// Gold läuft gut → moderate Multi-Timeframe-Checks.
 const SYMBOL_FILTERS = {
   'NDX': {
-    minAtrPercent: 0.10,     // viel höhere Mindest-Bewegung (NASDAQ ist volatil — nur starke Moves)
-    rsiBuy: [50, 62],        // engeres RSI-Fenster → nur klarere Momentum-Signale
+    minAtrPercent: 0.10,
+    rsiBuy: [50, 62],
     rsiSell: [38, 50],
-    cooldownMin: 30,         // längere Pause zwischen Trades (weniger Overtrading)
-    requireBiasAlign: true,  // strikt nur in Bias-Richtung
-    require15mAlign: true,   // nur wenn 15M-Trend übereinstimmt
-    require4hAlign: true,    // 4H-Trend muss übereinstimmen (Multi-TF Bias)
-    require5mAlign: true,    // 5M-Entry-Momentum muss passen
-    requireBOS: false,       // Break of Structure optional (kann zu streng sein)
-    requireLiquidity: true,  // nur traden wenn Liquidität in Trade-Richtung liegt
-    sweepBoost: true,        // Liquidity Sweep als Bonus-Bestätigung (nicht zwingend)
+    cooldownMin: 30,
+    requireBiasAlign: true,
+    require15mAlign: true,
+    require4hAlign: true,
+    require5mAlign: true,
+    requireBOS: false,
+    requireLiquidity: true,
+    sweepBoost: true,
   },
   'XAUUSD': {
     minAtrPercent: CONFIG.MIN_ATR_PERCENT,
@@ -77,11 +77,11 @@ const SYMBOL_FILTERS = {
     cooldownMin: CONFIG.COOLDOWN_MIN,
     requireBiasAlign: CONFIG.REQUIRE_BIAS_ALIGN,
     require15mAlign: false,
-    require4hAlign: true,    // 4H-Trend muss übereinstimmen (Multi-TF Bias)
-    require5mAlign: true,    // 5M-Entry-Momentum muss passen
-    requireBOS: false,       // Break of Structure optional
-    requireLiquidity: true,  // nur traden wenn Liquidität in Trade-Richtung liegt
-    sweepBoost: true,        // Liquidity Sweep als Bonus-Bestätigung (nicht zwingend)
+    require4hAlign: true,
+    require5mAlign: true,
+    requireBOS: false,
+    requireLiquidity: true,
+    sweepBoost: true,
   },
 };
 function getFilters(sessionKey) {
@@ -90,12 +90,12 @@ function getFilters(sessionKey) {
 
 // ── Pip- & Geldwert-Definitionen pro Symbol ──
 // Gold: 1 Pip = 0.1 Preis-Einheiten. NASDAQ: 1 Pip = 1 Punkt.
-// Geldwert pro Pip bei 0.01 Lot (Standard-Demo-Kontraktgrößen, Näherung in USD).
+// moneyPerPipPerLot = USD pro Pip bei 0.01 Referenz-Lot. Skaliert über LOT_SIZE.
 const PIP_INFO = {
-  'XAUUSD': { pipSize: 0.1, moneyPerPipPerLot: 0.10 },  // 0.01 Lot Gold: $1 pro $1-Bewegung → $0.10/Pip
-  'NDX':    { pipSize: 1.0, moneyPerPipPerLot: 0.20 },  // 0.01 Lot NAS100 ≈ $0.20/Punkt (Näherung)
+  'XAUUSD': { pipSize: 0.1, moneyPerPipPerLot: 0.10 },
+  'NDX':    { pipSize: 1.0, moneyPerPipPerLot: 0.20 },
 };
-const LOT_SIZE = 0.01;
+const LOT_SIZE = 1;   // von 0.01 → 1.0 (volles Lot). Faktor (LOT_SIZE/0.01) = ×100.
 
 // Wandelt eine Preis-Differenz in Pips + Geldwert um
 function toPipsAndMoney(sessionKey, priceDiff) {
@@ -105,7 +105,7 @@ function toPipsAndMoney(sessionKey, priceDiff) {
   return { pips, money };
 }
 
-// Formatiert PnL als "+12.5 Pips (+$1.25)" — sessionKey bestimmt Pip-Größe
+// Formatiert PnL als "+12.5 Pips (+$1.25)"
 function fmtPnl(sessionKey, priceDiff) {
   const { pips, money } = toPipsAndMoney(sessionKey, priceDiff);
   const sign = priceDiff >= 0 ? '+' : '';
@@ -145,7 +145,6 @@ function atrCalc(closes, highs, lows, n = 14) {
 function aggregateTo15M(closes, highs, lows) {
   return aggregateTF(closes, highs, lows, 15);
 }
-// Generische Aggregation: fasst N 1M-Kerzen zu einer größeren Kerze zusammen
 function aggregateTF(closes, highs, lows, size) {
   const out = { closes: [], highs: [], lows: [] };
   for (let i = 0; i + size <= closes.length; i += size) {
@@ -162,7 +161,6 @@ function get15MTrend(closes, highs, lows) {
   if (e12 === null || e26 === null) return null;
   return e12 > e26 ? 'BUY' : 'SELL';
 }
-// Trend auf beliebigem Timeframe (size = Anzahl 1M-Kerzen pro Kerze)
 function getTrendOnTF(closes, highs, lows, size) {
   const tf = aggregateTF(closes, highs, lows, size);
   if (tf.closes.length < 26) return null;
@@ -170,7 +168,6 @@ function getTrendOnTF(closes, highs, lows, size) {
   if (e12 === null || e26 === null) return null;
   return e12 > e26 ? 'BUY' : 'SELL';
 }
-// 5M-Entry-Bestätigung: kurzfristiges Momentum über EMA9 vs EMA21
 function get5MTrend(closes, highs, lows) {
   const tf = aggregateTF(closes, highs, lows, 5);
   if (tf.closes.length < 21) return null;
@@ -180,84 +177,57 @@ function get5MTrend(closes, highs, lows) {
 }
 
 // ─── LIQUIDITÄT (1H Swing-Highs/Lows als Annäherung) ──────────────────────────
-// Findet markante Hochs/Tiefs auf dem 1H-Chart. Liquidität liegt typischerweise
-// über letzten Hochs (Short-Stops) und unter letzten Tiefs (Long-Stops).
 function findLiquidity(closes, highs, lows) {
-  const h1 = aggregateTF(closes, highs, lows, 60); // 60 × 1M = 1H
+  const h1 = aggregateTF(closes, highs, lows, 60);
   if (h1.closes.length < 10) return null;
   const cur = closes[closes.length - 1];
-  const lookback = Math.min(20, h1.highs.length); // letzte ~20 Stunden
+  const lookback = Math.min(20, h1.highs.length);
   const recentHighs = h1.highs.slice(-lookback);
   const recentLows = h1.lows.slice(-lookback);
-
-  // Nächstes Hoch ÜBER dem aktuellen Preis = Liquidität oben (Long-Ziel)
   const liqAbove = recentHighs.filter(h => h > cur).sort((a, b) => a - b)[0] || null;
-  // Nächstes Tief UNTER dem aktuellen Preis = Liquidität unten (Short-Ziel)
   const liqBelow = recentLows.filter(l => l < cur).sort((a, b) => b - a)[0] || null;
-
   return { liqAbove, liqBelow, cur };
 }
 
 // ─── BREAK OF STRUCTURE (vereinfacht) ─────────────────────────────────────────
-// Prüft ob der Preis das letzte markante Hoch (bullish BOS) oder Tief (bearish BOS)
-// auf dem 15M-Chart gebrochen hat. Anerkanntes Konzept, hier regelbasiert.
 function breakOfStructure(closes, highs, lows) {
   const tf = aggregateTF(closes, highs, lows, 15);
   if (tf.closes.length < 8) return null;
   const cur = tf.closes[tf.closes.length - 1];
-  // Letzte 6 Kerzen OHNE die aktuelle betrachten
   const prevHighs = tf.highs.slice(-7, -1);
   const prevLows = tf.lows.slice(-7, -1);
   const lastSwingHigh = Math.max(...prevHighs);
   const lastSwingLow = Math.min(...prevLows);
-  if (cur > lastSwingHigh) return 'BUY';  // bullish Break of Structure
-  if (cur < lastSwingLow) return 'SELL';  // bearish Break of Structure
-  return null; // keine Struktur gebrochen
+  if (cur > lastSwingHigh) return 'BUY';
+  if (cur < lastSwingLow) return 'SELL';
+  return null;
 }
 
 // ─── LIQUIDITY SWEEP / STOP-HUNT (ICT-Konzept) ────────────────────────────────
-// Erkennt wenn der Preis ein letztes Hoch/Tief kurz durchstößt (sweept die Stops
-// dort) und dann WIEDER ZURÜCK auf die andere Seite schließt = Umkehr-Signal.
-// Wird auf dem 15M-Chart berechnet. Gibt 'BUY', 'SELL' oder null zurück.
 function liquiditySweep(closes, highs, lows) {
   const tf = aggregateTF(closes, highs, lows, 15);
   if (tf.closes.length < 6) return null;
-
   const n = tf.closes.length;
   const curHigh = tf.highs[n - 1];
   const curLow = tf.lows[n - 1];
   const curClose = tf.closes[n - 1];
-
-  // Referenz: letzte 5 Kerzen VOR der aktuellen
   const refHighs = tf.highs.slice(-6, -1);
   const refLows = tf.lows.slice(-6, -1);
   if (refHighs.length < 5) return null;
   const prevHigh = Math.max(...refHighs);
   const prevLow = Math.min(...refLows);
-
-  // Bullish Sweep: aktuelle Kerze stößt UNTER das letzte Tief (Stop-Hunt),
-  // schließt aber wieder DARÜBER → Käufer übernehmen → BUY
   if (curLow < prevLow && curClose > prevLow) return 'BUY';
-
-  // Bearish Sweep: aktuelle Kerze stößt ÜBER das letzte Hoch (Stop-Hunt),
-  // schließt aber wieder DARUNTER → Verkäufer übernehmen → SELL
   if (curHigh > prevHigh && curClose < prevHigh) return 'SELL';
-
-  return null; // kein Sweep
+  return null;
 }
 
 // ─── FAIR VALUE GAP (FVG) ─────────────────────────────────────────────────────
-// Eine 3-Kerzen-Lücke auf 5M-Basis: bei einem bullischen FVG liegt das Tief von
-// Kerze[n] über dem Hoch von Kerze[n-2] (Preis lief "zu schnell" hoch, Lücke bleibt).
-// Gibt true zurück wenn ein FVG in Signal-Richtung existiert.
 function detectFVG(closes, highs, lows, signal) {
   const tf = aggregateTF(closes, highs, lows, 5);
   const n = tf.closes.length;
   if (n < 3) return false;
   const h = tf.highs, l = tf.lows;
-  // Bullisch: Lücke nach oben (Tief der letzten Kerze > Hoch der vorletzten-1)
   const bullFVG = l[n - 1] > h[n - 3];
-  // Bärisch: Lücke nach unten (Hoch der letzten Kerze < Tief der vorletzten-1)
   const bearFVG = h[n - 1] < l[n - 3];
   if (signal === 'BUY') return bullFVG;
   if (signal === 'SELL') return bearFVG;
@@ -265,12 +235,10 @@ function detectFVG(closes, highs, lows, signal) {
 }
 
 // ─── KERZEN-STÄRKE ("Volume"-Annäherung) ──────────────────────────────────────
-// Verhältnis Körper zu Gesamtspanne der letzten 1M-Kerze. Großer Körper mit
-// kleinen Dochten = entschlossener Schluss = Annäherung an "starke Volume-Kerze".
 function bodyStrength(closes, highs, lows) {
   const n = closes.length;
   if (n < 2) return 0;
-  const open = closes[n - 2]; // Vorkerzen-Close ~ aktueller Open
+  const open = closes[n - 2];
   const close = closes[n - 1];
   const high = highs[n - 1];
   const low = lows[n - 1];
@@ -287,10 +255,8 @@ function runStrategy(closes, highs, lows, sessionKey) {
 
   const filt = getFilters(sessionKey);
 
-  // Ist gerade Asia-Session? Dann strengere Filter anwenden
   const tNow = berlinMinutesOfDay();
   const isAsia = tNow >= CONFIG.ASIA_START_MIN && tNow < CONFIG.ASIA_END_MIN;
-  // Ist gerade Abend (späte US-Session)? Dann ebenfalls strenger
   const isEvening = tNow >= CONFIG.EVENING_START_MIN && tNow < CONFIG.EVENING_END_MIN;
 
   const e12n = ema(closes, 12), e26n = ema(closes, 26);
@@ -302,7 +268,6 @@ function runStrategy(closes, highs, lows, sessionKey) {
 
   const rv = rsiCalc(closes);
   if (rv === null) return null;
-  // RSI-Fenster: Asia/Abend am strengsten, sonst symbol-spezifisch
   let rsiBuyRange = filt.rsiBuy, rsiSellRange = filt.rsiSell;
   if (isAsia) { rsiBuyRange = CONFIG.ASIA_RSI_BUY; rsiSellRange = CONFIG.ASIA_RSI_SELL; }
   else if (isEvening) { rsiBuyRange = CONFIG.EVENING_RSI_BUY; rsiSellRange = CONFIG.EVENING_RSI_SELL; }
@@ -319,7 +284,6 @@ function runStrategy(closes, highs, lows, sessionKey) {
 
   const atrV = atrCalc(closes, highs, lows) || cur * 0.005;
 
-  // ATR-Filter: Asia/Abend am strengsten, sonst symbol-spezifisch
   const atrPercent = (atrV / cur) * 100;
   let minAtr = filt.minAtrPercent;
   if (isAsia) minAtr = Math.max(CONFIG.ASIA_MIN_ATR_PERCENT, filt.minAtrPercent);
@@ -332,42 +296,32 @@ function runStrategy(closes, highs, lows, sessionKey) {
 
   const signal = buyS ? 'BUY' : 'SELL';
 
-  // ── Multi-Timeframe-Filter (aus dem Profi-Konzept: Bias → Liquidität → Entry) ──
-
-  // 15M-Trend (Entry-Ebene, optional)
   if (filt.require15mAlign) {
     const t15 = get15MTrend(closes, highs, lows);
     if (t15 && t15 !== signal) return null;
   }
-  // 4H-Trend (Bias-Ebene): großer Trend muss zur Signal-Richtung passen
   if (filt.require4hAlign) {
-    const t4h = getTrendOnTF(closes, highs, lows, 240); // 240 × 1M = 4H
+    const t4h = getTrendOnTF(closes, highs, lows, 240);
     if (t4h && t4h !== signal) return null;
   }
-  // 5M-Momentum (Entry-Ebene): kurzfristiges Momentum muss passen
   if (filt.require5mAlign) {
     const t5 = get5MTrend(closes, highs, lows);
     if (t5 && t5 !== signal) return null;
   }
-  // Break of Structure (15M): nur traden wenn Struktur in Signal-Richtung gebrochen
   if (filt.requireBOS) {
     const bos = breakOfStructure(closes, highs, lows);
     if (bos && bos !== signal) return null;
   }
-  // Liquidität (1H Swing-Punkte): nur traden wenn "Ziel-Liquidität" in Trade-Richtung liegt
   let liqInfo = null;
   if (filt.requireLiquidity) {
     const liq = findLiquidity(closes, highs, lows);
     if (liq) {
       liqInfo = liq;
-      // BUY braucht Liquidität oben (liqAbove), SELL braucht Liquidität unten (liqBelow)
       if (signal === 'BUY' && liq.liqAbove === null) return null;
       if (signal === 'SELL' && liq.liqBelow === null) return null;
     }
   }
 
-  // Liquidity Sweep (ICT): Bonus-Bestätigung. Wenn gerade ein Sweep in Signal-Richtung
-  // passiert ist (Stop-Hunt + Umkehr), ist das ein besonders starkes Setup.
   let sweptLiquidity = false;
   if (filt.sweepBoost) {
     const sweep = liquiditySweep(closes, highs, lows);
@@ -381,34 +335,25 @@ function runStrategy(closes, highs, lows, sessionKey) {
   const tp3 = parseFloat((cur + dir * atrV * CONFIG.TP3_MULT).toFixed(2));
   const rr = (CONFIG.TP1_MULT / CONFIG.SL_MULT).toFixed(2);
 
-  // Liquiditäts-Ziel für die Nachricht (wohin der Markt "will")
   const liqTarget = liqInfo
     ? (signal === 'BUY' ? liqInfo.liqAbove : liqInfo.liqBelow)
     : null;
 
-  // ── GRADING-SYSTEM (inspiriert vom A+/A/B/C Indikator) ───────────────────────
-  // Zählt erfüllte Qualitäts-Faktoren und vergibt eine Note. Jeder Faktor ist
-  // eine echte, aus den Kerzen ableitbare Bestätigung (kein Fake, kein SMT).
   const t4hGrade = getTrendOnTF(closes, highs, lows, 240);
   const t15Grade = get15MTrend(closes, highs, lows);
-
-  // FVG (Fair Value Gap): Lücke zwischen Kerze[n-2] und Kerze[n] auf 5M-Basis
   const fvg = detectFVG(closes, highs, lows, signal);
-
-  // Starke Kerze ("Volume"-Annäherung): großer Körper relativ zur Gesamtspanne
   const lastBodyRatio = bodyStrength(closes, highs, lows);
   const strongCandle = lastBodyRatio >= 0.6;
 
   const factors = {
-    sweep: sweptLiquidity,                                  // Liquidity Sweep
-    liquidity: !!liqTarget,                                 // klares Ziel (Clear Targets)
-    biasAlign: !!(t4hGrade && t4hGrade === signal),         // 4H Bias
-    entryAlign: !!(t15Grade && t15Grade === signal),        // 15M Entry
-    fvg: fvg,                                               // Fair Value Gap
-    strongCandle: strongCandle,                             // starker Kerzenschluss
+    sweep: sweptLiquidity,
+    liquidity: !!liqTarget,
+    biasAlign: !!(t4hGrade && t4hGrade === signal),
+    entryAlign: !!(t15Grade && t15Grade === signal),
+    fvg: fvg,
+    strongCandle: strongCandle,
   };
   const score = Object.values(factors).filter(Boolean).length;
-  // Note: 6 Faktoren → A+ (≥5), A (4), B (3), C (≤2)
   let grade = 'C';
   if (score >= 5) grade = 'A+';
   else if (score === 4) grade = 'A';
@@ -427,15 +372,14 @@ function runStrategy(closes, highs, lows, sessionKey) {
 }
 
 // ─── SWING-STRATEGIE: Trend-Following mit Pullback (1H) ────────────────────────
-// Anders als der Scalp: wartet auf etablierten Trend + günstigen Pullback-Einstieg
 function runSwingStrategy(closes, highs, lows) {
   const need = CONFIG.SWING_EMA_SLOW + 5;
-  if (closes.length < need) return null; // braucht genug Historie für EMA200
+  if (closes.length < need) return null;
 
   const cur = closes[closes.length - 1];
-  const emaFast = ema(closes, CONFIG.SWING_EMA_FAST);   // EMA 50
-  const emaSlow = ema(closes, CONFIG.SWING_EMA_SLOW);   // EMA 200
-  const emaPull = ema(closes, CONFIG.SWING_PULLBACK_EMA); // EMA 20
+  const emaFast = ema(closes, CONFIG.SWING_EMA_FAST);
+  const emaSlow = ema(closes, CONFIG.SWING_EMA_SLOW);
+  const emaPull = ema(closes, CONFIG.SWING_PULLBACK_EMA);
   if ([emaFast, emaSlow, emaPull].some(v => v === null)) return null;
 
   const rv = rsiCalc(closes);
@@ -443,14 +387,10 @@ function runSwingStrategy(closes, highs, lows) {
 
   const atrV = atrCalc(closes, highs, lows) || cur * 0.005;
 
-  // Trend-Definition: EMA50 vs EMA200
   const uptrend = emaFast > emaSlow;
   const downtrend = emaFast < emaSlow;
-
-  // Pullback: Preis ist nah an der EMA20 zurückgekommen (innerhalb 0.5×ATR)
   const nearPullback = Math.abs(cur - emaPull) <= atrV * 0.5;
 
-  // Einstieg: Trend + Pullback + RSI bestätigt Momentum-Richtung
   const buy = uptrend && nearPullback && cur > emaPull && rv > 45 && rv < 70;
   const sell = downtrend && nearPullback && cur < emaPull && rv < 55 && rv > 30;
   if (!buy && !sell) return null;
@@ -480,19 +420,17 @@ function berlinParts() {
 }
 function getBerlinDate() { return new Date().toLocaleDateString('de-DE', { timeZone: 'Europe/Berlin' }); }
 function getBerlinTime() { return new Date().toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' }); }
-// Minuten seit Mitternacht (Berlin) — für saubere Zeitfenster-Checks
 function berlinMinutesOfDay() { const { hour, min } = berlinParts(); return hour * 60 + min; }
 
-// Zeitfenster (in Minuten seit Mitternacht)
 const T = {
-  MORNING: 8 * 60,          // 08:00 — Guten Morgen / Bot aktiv
-  ASIA_START: 2 * 60,       // 02:00
-  ASIA_END: 9 * 60,         // 09:00
-  LONDON_END: 15 * 60 + 30, // 15:30
-  NYC_OPEN: 15 * 60 + 30,   // 15:30
-  RANGE_END: 15 * 60 + 45,  // 15:45
-  NYC_CLOSE: 22 * 60,       // 22:00
-  REPORT: 22 * 60,          // 22:00
+  MORNING: 8 * 60,
+  ASIA_START: 2 * 60,
+  ASIA_END: 9 * 60,
+  LONDON_END: 15 * 60 + 30,
+  NYC_OPEN: 15 * 60 + 30,
+  RANGE_END: 15 * 60 + 45,
+  NYC_CLOSE: 22 * 60,
+  REPORT: 22 * 60,
 };
 
 // ─── SESSION STATE ────────────────────────────────────────────────────────────
@@ -509,7 +447,6 @@ function freshSession() {
 }
 const sessionData = { 'XAUUSD': freshSession(), 'NDX': freshSession() };
 
-// Globaler Tages-Tracker für Nachrichten die nur EINMAL pro Tag kommen (nicht pro Symbol)
 const dailyFlags = { date: null, morningSent: false };
 function resetDailyFlagsIfNeeded() {
   const today = getBerlinDate();
@@ -522,7 +459,6 @@ function resetDailyFlagsIfNeeded() {
 function resetDayIfNeeded(sd) {
   const today = getBerlinDate();
   if (sd.date !== today) {
-    const perf = sd.performance; // Performance über Nacht behalten? Nein — täglich frisch.
     Object.assign(sd, freshSession());
     sd.date = today;
     console.log(`🔄 Day reset für ${today}`);
@@ -531,20 +467,14 @@ function resetDayIfNeeded(sd) {
 
 function updateSessions(sd, high, low) {
   const t = berlinMinutesOfDay();
-
-  // Asia: 02:00–09:00
   if (t >= T.ASIA_START && t < T.ASIA_END) {
     if (sd.asiaHigh === null || high > sd.asiaHigh) sd.asiaHigh = high;
     if (sd.asiaLow === null || low < sd.asiaLow) sd.asiaLow = low;
   }
-
-  // London: 09:00–15:30
   if (t >= T.ASIA_END && t < T.LONDON_END) {
     if (sd.asiaHigh !== null && high > sd.asiaHigh) sd.londonBrokeHigh = true;
     if (sd.asiaLow !== null && low < sd.asiaLow) sd.londonBrokeLow = true;
   }
-
-  // NYC Opening Range: 15:30–15:45
   if (t >= T.NYC_OPEN && t < T.RANGE_END) {
     if (sd.openingRange.high === null || high > sd.openingRange.high) sd.openingRange.high = high;
     if (sd.openingRange.low === null || low < sd.openingRange.low) sd.openingRange.low = low;
@@ -568,7 +498,7 @@ function calcDailyBias(sd) {
 
 function checkOpeningRangeBreakout(sd, close) {
   if (sd.openingRange.high === null || sd.openingRange.low === null) return null;
-  if (berlinMinutesOfDay() < T.RANGE_END) return null; // Range noch nicht abgeschlossen
+  if (berlinMinutesOfDay() < T.RANGE_END) return null;
   if (close > sd.openingRange.high) return 'BUY';
   if (close < sd.openingRange.low) return 'SELL';
   return null;
@@ -591,18 +521,13 @@ function recordTrade(sd, trade, result, pnl) {
 }
 
 // ─── OPEN TRADES TRACKER ────────────────────────────────────────────────────
-// Pro Symbol max. 1 offener Trade gleichzeitig → kein Durcheinander
-const openTrades = []; // { symbol, signal, entry, sl, tp, rr, type, openedAt(ms) }
-
-// Signal-Historie fürs Dashboard (letzte 30 gesendete Signale)
-const signalLog = []; // { time, symbol, signal, type, grade, entry }
+const openTrades = [];
+const signalLog = [];
 function logSignal(entry) {
   signalLog.unshift(entry);
   if (signalLog.length > 30) signalLog.pop();
 }
-
-// Cooldown: Zeitpunkt des letzten Trades pro Symbol (verhindert Doppel-Feuern)
-const lastTradeTime = {}; // normSym -> ms
+const lastTradeTime = {};
 
 function hasOpenTrade(symbol) {
   return openTrades.some(t => t.symbol === symbol);
@@ -629,11 +554,8 @@ async function checkOpenTrades(symbol, high, low) {
     const isBuy = trade.signal === 'BUY';
     const typeLabel = trade.type === 'opening_range' ? 'Opening Range' : trade.type === 'swing' ? '🟠 Swing' : '4-Confirm';
     const dirEmoji = isBuy ? '📈' : '📉';
-
-    // Hilfsfunktion: wurde ein Level erreicht?
     const reached = (level) => isBuy ? high >= level : low <= level;
 
-    // ── TP1 ── → Trade zählt als WIN (nur einmal werten)
     if (!trade.tp1Hit && reached(trade.tp1)) {
       trade.tp1Hit = true;
       const pnl = Math.abs(trade.tp1 - trade.entry);
@@ -656,11 +578,9 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
       console.log(`🎯 TP1 HIT: ${trade.signal} ${assetLabel}`);
     }
 
-    // ── TP2 ── → SL auf Break-Even
     if (trade.tp1Hit && !trade.tp2Hit && reached(trade.tp2)) {
       trade.tp2Hit = true;
-      const pnl = Math.abs(trade.tp2 - trade.entry);
-      if (CONFIG.BREAKEVEN_AFTER_TP2) trade.sl = trade.entry; // Break-Even
+      if (CONFIG.BREAKEVEN_AFTER_TP2) trade.sl = trade.entry;
       await sendTelegram(`🎯 *TP2 HIT — ${assetLabel}* ✅
 
 ${dirEmoji} ${trade.signal} · ${typeLabel}
@@ -672,9 +592,7 @@ ${CONFIG.BREAKEVEN_AFTER_TP2 ? '🛡 *SL jetzt auf Break-Even* — Rest läuft r
       console.log(`🎯 TP2 HIT: ${trade.signal} ${assetLabel} → Break-Even`);
     }
 
-    // ── TP3 ── → Trade komplett geschlossen (voll durchgelaufen)
     if (trade.tp2Hit && reached(trade.tp3)) {
-      const pnl = Math.abs(trade.tp3 - trade.entry);
       await sendTelegram(`🎯 *TP3 HIT — ${assetLabel}* 🏆
 
 ${dirEmoji} ${trade.signal} · ${typeLabel}
@@ -683,15 +601,13 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
 ✅ Trade abgeschlossen.
 ⚡ _Apex Signal Bot_`);
       console.log(`🏆 TP3 HIT: ${trade.signal} ${assetLabel} — geschlossen`);
-      continue; // Trade entfernt (nicht in remaining)
+      continue;
     }
 
-    // ── SL ── (kann Break-Even sein nach TP2)
     const slHit = isBuy ? low <= trade.sl : high >= trade.sl;
     if (slHit) {
       const atBreakeven = trade.tp1Hit && trade.sl === trade.entry;
       if (atBreakeven) {
-        // Break-Even Stop nach TP1/TP2 — kein zusätzlicher Verlust, WIN steht schon
         await sendTelegram(`🛡 *BREAK-EVEN STOP — ${assetLabel}*
 
 ${dirEmoji} ${trade.signal} · ${typeLabel}
@@ -700,7 +616,6 @@ Position bei Entry \`${trade.entry.toFixed(2)}\` geschlossen.
 ⚡ _Apex Signal Bot_`);
         console.log(`🛡 Break-Even Stop: ${trade.signal} ${assetLabel}`);
       } else {
-        // Echter Verlust — nur werten wenn TP1 noch NICHT getroffen war
         const pnl = -Math.abs(trade.entry - trade.sl);
         if (sd && !trade.tp1Hit) recordTrade(sd, trade, 'LOSS', pnl);
         const total = sd ? sd.performance.wins + sd.performance.losses : 0;
@@ -717,13 +632,11 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
 ⚡ _Apex Signal Bot_`);
         console.log(`❌ LOSS: ${trade.signal} ${assetLabel}`);
       }
-      continue; // Trade entfernt
+      continue;
     }
 
-    // ── Timeout ──
     const timeoutMin = trade.timeoutMin || CONFIG.TRADE_TIMEOUT_MIN;
     if ((now - trade.openedAt) > timeoutMin * 60 * 1000) {
-      // Wenn TP1 schon getroffen: Trade war Win, einfach schließen. Sonst neutral.
       if (!trade.tp1Hit) {
         await sendTelegram(`⏱ *TIMEOUT — ${assetLabel}*
 
@@ -733,10 +646,9 @@ Trade nach Zeitlimit geschlossen (kein TP/SL erreicht).
 ⚡ _Apex Signal Bot_`);
         console.log(`⏱ TIMEOUT: ${trade.signal} ${assetLabel}`);
       }
-      continue; // Trade entfernt
+      continue;
     }
 
-    // Trade bleibt offen
     remaining.push(trade);
   }
 
@@ -850,7 +762,6 @@ function buildSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, rsi, macd, 
   const liqLine = liqTarget ? `\n💧 *Liquiditäts-Ziel:* \`${liqTarget.toFixed(2)}\`` : '';
   const sweepLine = swept ? `\n🎯 *Liquidity Sweep erkannt!* _(Stop-Hunt + Umkehr — starkes Setup)_` : '';
 
-  // Grade-Box (wie der A+/A/B/C Indikator) — zeigt welche Faktoren erfüllt sind
   let gradeBox = '';
   if (factors) {
     const chk = (b) => b ? '✅' : '⬜️';
@@ -944,11 +855,55 @@ const store = {
   'XAUUSD': { closes: [], highs: [], lows: [], lastSignal: null },
   'NDX':    { closes: [], highs: [], lows: [], lastSignal: null },
 };
-// Separate Speicher für 1H Swing-Kerzen (damit sie sich nicht mit 1M Scalp mischen)
+// Separate Speicher für 1H Swing-Kerzen (werden aus dem 1M-Feed gebaut)
 const swingStore = {
   'XAUUSD': { closes: [], highs: [], lows: [], lastSignal: null },
   'NDX':    { closes: [], highs: [], lows: [], lastSignal: null },
 };
+
+// ─── SWING 1H-BUILDER (aus dem 1M-Feed — kein separater Swing-Alarm nötig) ─────
+// Zwischenspeicher für die gerade "im Bau" befindliche 1H-Kerze pro Symbol
+const swingBuilder = {
+  'XAUUSD': { hourKey: null, h: null, l: null, c: null },
+  'NDX':    { hourKey: null, h: null, l: null, c: null },
+};
+function currentHourKey() {
+  return new Date()
+    .toLocaleString('sv-SE', {
+      timeZone: 'Europe/Berlin',
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit',
+    })
+    .slice(0, 13); // "YYYY-MM-DD HH"
+}
+// Bei JEDER 1M-Kerze aufrufen. Gibt die abgeschlossene 1H-Kerze zurück (→ Strategie
+// prüfen), sonst null solange die Stunde läuft. Legt fertige 1H-Kerzen in swingStore.
+function feedSwingCandle(sessionKey, close, high, low) {
+  const b = swingBuilder[sessionKey];
+  if (!b) return null;
+  const hk = currentHourKey();
+
+  if (b.hourKey === null) {
+    b.hourKey = hk; b.h = high; b.l = low; b.c = close;
+    return null;
+  }
+  if (hk !== b.hourKey) {
+    const finished = { close: b.c, high: b.h, low: b.l };
+    const st = swingStore[sessionKey];
+    st.closes.push(finished.close);
+    st.highs.push(finished.high);
+    st.lows.push(finished.low);
+    while (st.closes.length > CONFIG.MAX_CANDLES) {
+      st.closes.shift(); st.highs.shift(); st.lows.shift();
+    }
+    b.hourKey = hk; b.h = high; b.l = low; b.c = close;
+    return finished;
+  }
+  b.h = Math.max(b.h, high);
+  b.l = Math.min(b.l, low);
+  b.c = close;
+  return null;
+}
+
 function isSwing(symbol) {
   return symbol.toUpperCase().includes('SWING');
 }
@@ -972,10 +927,50 @@ function getAssetLabel(symbol) {
   if (s.includes('NAS') || s.includes('NDX') || s.includes('US100') || s.includes('NQ')) return 'NASDAQ 100';
   return symbol;
 }
-// Eindeutiger Key für openTrades/lastSignal. Swing bekommt eigenen Key (z.B. XAUUSD_SWING)
 function normalizeSymbol(symbol) {
   const base = getSessionKey(symbol) || symbol.toUpperCase();
   return isSwing(symbol) ? `${base}_SWING` : base;
+}
+
+// ─── PERSISTENZ (Railway Volume) ───────────────────────────────────────────────
+// Speichert Swing-Warmup + offene Trades, damit ein Redeploy sie nicht killt.
+// In Railway ein Volume anlegen und auf /data mounten (oder DATA_DIR env setzen).
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const STATE_FILE = path.join(DATA_DIR, 'apex-state.json');
+
+function saveState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const state = { v: 1, savedAt: Date.now(), swingStore, swingBuilder, openTrades, lastTradeTime };
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+  } catch (e) {
+    console.warn('⚠️ State speichern fehlgeschlagen (Volume auf /data gemountet?):', e.message);
+  }
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      console.log('ℹ️ Kein gespeicherter State — starte frisch (Swing sammelt neu).');
+      return;
+    }
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    for (const k of ['XAUUSD', 'NDX']) {
+      if (s.swingStore && s.swingStore[k]) {
+        swingStore[k].closes = s.swingStore[k].closes || [];
+        swingStore[k].highs  = s.swingStore[k].highs  || [];
+        swingStore[k].lows   = s.swingStore[k].lows   || [];
+        swingStore[k].lastSignal = s.swingStore[k].lastSignal || null;
+      }
+      if (s.swingBuilder && s.swingBuilder[k]) Object.assign(swingBuilder[k], s.swingBuilder[k]);
+    }
+    if (Array.isArray(s.openTrades)) { openTrades.length = 0; openTrades.push(...s.openTrades); }
+    if (s.lastTradeTime) Object.assign(lastTradeTime, s.lastTradeTime);
+    const age = s.savedAt ? Math.round((Date.now() - s.savedAt) / 1000) : '?';
+    console.log(`✅ State geladen: ${swingStore['XAUUSD'].closes.length} XAU / ${swingStore['NDX'].closes.length} NDX Swing-Kerzen · ${openTrades.length} offene Trades (vor ${age}s gesichert)`);
+  } catch (e) {
+    console.warn('⚠️ State laden fehlgeschlagen:', e.message);
+  }
 }
 
 // ─── SERVER ────────────────────────────────────────────────────────────────────
@@ -1102,7 +1097,7 @@ td{padding:11px 13px;border-top:1px solid var(--border);font-size:13px}
 
     <!-- SEITE: Verlauf -->
     <div class="page hidden" id="page-history">
-      <div class="sect">Trade-Historie · Pips & Geld bei 0.01 Lot</div>
+      <div class="sect">Trade-Historie · Pips & Geld bei 1.0 Lot</div>
       <table><thead><tr><th>Zeit</th><th>Richtung</th><th>Ergebnis</th><th>Pips</th><th>Geld</th></tr></thead>
       <tbody id="history"><tr><td colspan="5" class="empty">Lädt...</td></tr></tbody></table>
     </div>
@@ -1134,7 +1129,6 @@ function nav(p){
   const info=PAGE_INFO[p];
   document.getElementById('pageTitle').innerHTML=info[0]+'<span class="eng" id="engtime">· '+(data?data.time:'live')+'</span>';
   document.getElementById('pageSub').textContent=info[1];
-  // Markt-Tabs nur auf Dashboard & Verlauf zeigen
   document.getElementById('markettabs').style.display=info[2]?'flex':'none';
   render();
 }
@@ -1177,7 +1171,6 @@ function render(){
   if(page==='signals'){renderSignals();return;}
   if(page==='strategy'){renderStrategy();return;}
   if(page==='history'){renderHistory();return;}
-  // page === dashboard
   if(cur==='combined'){
     const c=data.combined;
     document.getElementById('stats').innerHTML=
@@ -1195,12 +1188,11 @@ function render(){
       card('Total Geld',(d.totalMoney>=0?'+':'')+'$'+d.totalMoney,d.totalMoney>=0?'green':'red')+
       card('Total Pips',(d.totalPips>=0?'+':'')+d.totalPips,d.totalPips>=0?'green':'red')+
       card('Serie',d.streak+'× '+(d.streakType||'-'),d.streakType==='WIN'?'green':d.streakType==='LOSS'?'red':'white','beste: '+d.bestStreak+'×')+
-      card('Kerzen',d.candles,'blue','Swing: '+d.swingCandles+(d.swingCandles>=205?' ✅':''))+
+      card('Kerzen',d.candles,'blue','Swing: '+d.swingCandles+(d.swingCandles>=d.swingNeeded?' ✅':' / '+d.swingNeeded))+
       card('Bias',d.bias,'gold');
     drawEquity(d.equity);
     document.getElementById('eqlabel').textContent='· '+(cur==='gold'?'XAU/USD':'NASDAQ');
   }
-  // Offene Trades (nur die des gewählten Marktes auf dem Dashboard)
   const ot=data.openTrades.filter(t=>cur==='combined'?true:(cur==='gold'?t.symbol.includes('XAU'):t.symbol.includes('NASDAQ')));
   document.getElementById('opentrades').innerHTML=ot.length?ot.map(t=>{
     return '<div class="open"><span class="'+(t.signal==='BUY'?'buy':'sell')+'">'+t.signal+' · '+t.type+gradeTag(t.grade)+'</span><span class="muted">Entry '+t.entry+(t.tp1Hit?' · TP1✅':'')+(t.tp2Hit?' TP2🛡':'')+'</span></div>';
@@ -1215,7 +1207,6 @@ function renderHistory(){
   }
 }
 function mergeEquity(a,b){
-  // einfache Summe der kumulativen Kurven (auf gleiche Länge gebracht)
   const n=Math.max(a.length,b.length);const out=[];
   const la=a.length?a[a.length-1]:0, lb=b.length?b[b.length-1]:0;
   for(let i=0;i<n;i++){out.push((a[i]??la)+(b[i]??lb));}
@@ -1232,7 +1223,6 @@ function drawEquity(eq){
   const area=line+' L'+pts[pts.length-1][0].toFixed(1)+' '+(H-pad)+' L'+pad+' '+(H-pad)+' Z';
   const last=eq[eq.length-1];
   const col=last>=0?'#34F5C5':'#FF5C7C';
-  // Nulllinie
   const zeroY=H-pad-((0-min)/range)*(H-2*pad);
   svg.innerHTML=
     '<defs><linearGradient id="eg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="'+col+'" stop-opacity="0.35"/><stop offset="100%" stop-color="'+col+'" stop-opacity="0"/></linearGradient></defs>'+
@@ -1259,9 +1249,10 @@ const server = http.createServer((req, res) => {
   // Health check
   if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     const sd = sessionData['XAUUSD'];
+    const swingNeeded = CONFIG.SWING_EMA_SLOW + 5;
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end([
-      '⚡ Apex Signal Bot v3 läuft ✅',
+      '⚡ Apex Signal Bot v4 läuft ✅',
       `🕐 Berlin: ${getBerlinTime()} (${getBerlinDate()})`,
       '',
       `XAU/USD Kerzen: ${store['XAUUSD'].closes.length}`,
@@ -1275,11 +1266,12 @@ const server = http.createServer((req, res) => {
       `Opening Range: H ${sd.openingRange.high ?? '-'} / L ${sd.openingRange.low ?? '-'}`,
       `Performance heute: ${sd.performance.wins}W / ${sd.performance.losses}L`,
       '',
-      '── Swing (1H) — braucht 205 Kerzen für EMA200 ──',
-      `XAU/USD Swing-Kerzen: ${swingStore['XAUUSD'].closes.length} ${swingStore['XAUUSD'].closes.length >= 205 ? '✅' : '(sammelt...)'}`,
-      `NDX Swing-Kerzen:     ${swingStore['NDX'].closes.length} ${swingStore['NDX'].closes.length >= 205 ? '✅' : '(sammelt...)'}`,
+      `── Swing (1H aus 1M-Feed) — braucht ${swingNeeded} Kerzen für EMA${CONFIG.SWING_EMA_SLOW} ──`,
+      `XAU/USD Swing-Kerzen: ${swingStore['XAUUSD'].closes.length} ${swingStore['XAUUSD'].closes.length >= swingNeeded ? '✅' : '(sammelt...)'}`,
+      `NDX Swing-Kerzen:     ${swingStore['NDX'].closes.length} ${swingStore['NDX'].closes.length >= swingNeeded ? '✅' : '(sammelt...)'}`,
+      `💾 Persistenz: ${fs.existsSync(STATE_FILE) ? 'aktiv (' + STATE_FILE + ')' : 'INAKTIV — Volume auf /data mounten!'}`,
       '',
-      `Scalp: 5M · Cooldown ${CONFIG.COOLDOWN_MIN}min · Bias-Filter ${CONFIG.REQUIRE_BIAS_ALIGN ? 'an' : 'aus'}`,
+      `Scalp: Cooldown ${CONFIG.COOLDOWN_MIN}min · Bias-Filter ${CONFIG.REQUIRE_BIAS_ALIGN ? 'an' : 'aus'} · Lot ${LOT_SIZE}`,
       `Token gesetzt: ${TOKEN ? 'ja' : 'NEIN ⚠️'}`,
       '',
       '👉 Schickes Dashboard: /dashboard',
@@ -1288,13 +1280,13 @@ const server = http.createServer((req, res) => {
 
   // Dashboard JSON-Daten
   if (req.method === 'GET' && req.url === '/data') {
+    const swingNeeded = CONFIG.SWING_EMA_SLOW + 5;
     const build = (key) => {
       const sd = sessionData[key];
       const perf = sd.performance;
       const total = perf.wins + perf.losses;
       const totalPnlPrice = perf.trades.reduce((a, t) => a + t.pnl, 0);
       const { pips, money } = toPipsAndMoney(key, totalPnlPrice);
-      // Equity-Kurve: kumulierter Geld-Verlauf über die Trades
       let cum = 0;
       const equity = perf.trades.map(t => {
         cum += toPipsAndMoney(key, t.pnl).money;
@@ -1303,6 +1295,7 @@ const server = http.createServer((req, res) => {
       return {
         candles: store[key].closes.length,
         swingCandles: swingStore[key].closes.length,
+        swingNeeded,
         wins: perf.wins, losses: perf.losses,
         winRate: total > 0 ? (perf.wins / total * 100).toFixed(1) : '0',
         streak: perf.streak, streakType: perf.streakType,
@@ -1318,7 +1311,6 @@ const server = http.createServer((req, res) => {
       };
     };
     const gold = build('XAUUSD'), ndx = build('NDX');
-    // Kombinierte Gesamt-Stats über beide Märkte
     const allWins = gold.wins + ndx.wins;
     const allLosses = gold.losses + ndx.losses;
     const allTotal = allWins + allLosses;
@@ -1385,7 +1377,7 @@ const server = http.createServer((req, res) => {
         st.closes.push(close); st.highs.push(high); st.lows.push(low);
         if (st.closes.length > CONFIG.MAX_CANDLES) { st.closes.shift(); st.highs.shift(); st.lows.shift(); }
 
-        // Morgennachricht (08:00) — nur EINMAL pro Tag, egal welches Symbol triggert
+        // Morgennachricht (08:00) — nur EINMAL pro Tag
         resetDailyFlagsIfNeeded();
         if (berlinMinutesOfDay() >= T.MORNING && !dailyFlags.morningSent) {
           dailyFlags.morningSent = true;
@@ -1396,7 +1388,43 @@ const server = http.createServer((req, res) => {
         // 0. Offene Trades prüfen (TP/SL/Timeout)
         await checkOpenTrades(normSym, high, low);
 
-        // ─── SWING TRADES (1H) — Trend-Following + Pullback, eigenes Setup ───
+        // ─── SWING 1H aus dem 1M-Feed (Weg 2) ───────────────────────────
+        // Läuft nur für echte 1M-Scalp-Feeds, nicht für evtl. Alt-_SWING-Alerts.
+        if (!isSwing(symbol) && sessionKey) {
+          const swingKey = `${sessionKey}_SWING`;
+
+          // 1) Offenen Swing-Trade bei JEDEM 1M-Tick auf TP/SL prüfen
+          await checkOpenTrades(swingKey, high, low);
+
+          // 2) 1H-Kerze fortschreiben; bei Stundenschluss Swing-Strategie prüfen
+          const finishedHour = feedSwingCandle(sessionKey, close, high, low);
+          if (finishedHour) {
+            saveState(); // Warmup-Fortschritt sofort sichern
+            if (!hasOpenTrade(swingKey) && !inCooldown(swingKey)) {
+              const sst = swingStore[sessionKey];
+              const sw = runSwingStrategy(sst.closes, sst.highs, sst.lows);
+              if (sw) {
+                const sigKey = `${sw.signal}-${Math.round(sw.cur)}`;
+                if (sst.lastSignal !== sigKey) {
+                  sst.lastSignal = sigKey;
+                  await sendTelegram(buildSwingSignalMsg(
+                    sw.signal, assetLabel, sw.cur, sw.sl, sw.tp1, sw.tp2, sw.tp3, sw.rr, sw.rsi, sw.trend
+                  ));
+                  openTrades.push({
+                    symbol: swingKey, signal: sw.signal, entry: sw.cur,
+                    sl: sw.sl, tp1: sw.tp1, tp2: sw.tp2, tp3: sw.tp3, rr: sw.rr,
+                    type: 'swing', timeoutMin: CONFIG.SWING_TIMEOUT_MIN, openedAt: Date.now(),
+                  });
+                  logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: sw.signal, type: 'Swing', grade: null, entry: sw.cur });
+                  lastTradeTime[swingKey] = Date.now();
+                  console.log(`🟠 Swing (1H aus 1M): ${sw.signal} ${assetLabel} (${sw.trend})`);
+                }
+              }
+            }
+          }
+        }
+
+        // (Alt-Pfad: nur falls doch noch ein _SWING-Alert reinkommt — normalerweise inaktiv)
         if (isSwing(symbol)) {
           if (!hasOpenTrade(normSym) && !inCooldown(normSym)) {
             const sw = runSwingStrategy(st.closes, st.highs, st.lows);
@@ -1408,9 +1436,7 @@ const server = http.createServer((req, res) => {
                 openTrades.push({ symbol: normSym, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp1: sw.tp1, tp2: sw.tp2, tp3: sw.tp3, rr: sw.rr, type: 'swing', timeoutMin: CONFIG.SWING_TIMEOUT_MIN, openedAt: Date.now() });
                 logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: sw.signal, type: 'Swing', grade: null, entry: sw.cur });
                 lastTradeTime[normSym] = Date.now();
-                console.log(`🟠 Swing: ${sw.signal} ${assetLabel} (${sw.trend})`);
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ ok: true, signal: sw.signal, type: 'swing', entry: sw.cur }));
+                console.log(`🟠 Swing (Alt-Alert): ${sw.signal} ${assetLabel} (${sw.trend})`);
               }
             }
           }
@@ -1470,12 +1496,11 @@ const server = http.createServer((req, res) => {
           }
         }
 
-        // 5. 4-Confirm Signal — nur wenn kein offener Trade UND kein Cooldown aktiv
+        // 5. 4-Confirm Signal (Scalp) — nur wenn kein offener Trade UND kein Cooldown
         if (!hasOpenTrade(normSym) && !inCooldown(normSym)) {
           const result = runStrategy(st.closes, st.highs, st.lows, sessionKey);
           if (result) {
             const bias = sd?.lastBias || null;
-            // Bias-Filter: nur Trades in Richtung des Daily Bias (symbol-spezifisch)
             const biasBlocks = getFilters(sessionKey).requireBiasAlign
               && bias && bias !== 'WATCH' && bias !== 'NEUTRAL'
               && bias !== result.signal;
@@ -1513,7 +1538,14 @@ const server = http.createServer((req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Apex Signal Bot v3 läuft auf Port ${PORT}`);
-  console.log(`📊 Config: SL ${CONFIG.SL_MULT}×ATR · TP1/2/3 = ${CONFIG.TP1_MULT}/${CONFIG.TP2_MULT}/${CONFIG.TP3_MULT}×ATR · R:R bis TP1 = 1:${(CONFIG.TP1_MULT/CONFIG.SL_MULT).toFixed(2)}`);
+  loadState(); // gespeicherten Swing-Warmup + offene Trades laden (falls Volume vorhanden)
+  console.log(`🚀 Apex Signal Bot v4 läuft auf Port ${PORT}`);
+  console.log(`📊 Config: SL ${CONFIG.SL_MULT}×ATR · TP1/2/3 = ${CONFIG.TP1_MULT}/${CONFIG.TP2_MULT}/${CONFIG.TP3_MULT}×ATR · Lot ${LOT_SIZE} · Swing EMA${CONFIG.SWING_EMA_SLOW}`);
   if (!TOKEN) console.warn('⚠️  BOT_TOKEN nicht gesetzt!');
 });
+
+// State periodisch sichern (alle 30s) + sauber beim Herunterfahren (Railway-Redeploy)
+setInterval(saveState, 30000);
+function gracefulExit() { try { saveState(); } catch (_) {} process.exit(0); }
+process.on('SIGTERM', gracefulExit);
+process.on('SIGINT', gracefulExit);
