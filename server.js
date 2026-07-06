@@ -7,6 +7,7 @@ const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const broker = require('./broker'); // MetaApi (MT5) Ausführungs-Schicht
 
 const TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID || "-5280319758";
@@ -580,7 +581,7 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
 
     if (trade.tp1Hit && !trade.tp2Hit && reached(trade.tp2)) {
       trade.tp2Hit = true;
-      if (CONFIG.BREAKEVEN_AFTER_TP2) trade.sl = trade.entry;
+      if (CONFIG.BREAKEVEN_AFTER_TP2) { trade.sl = trade.entry; await broker.moveToBreakeven(trade.positionId, trade.entry, trade.tp3); }
       await sendTelegram(`🎯 *TP2 HIT — ${assetLabel}* ✅
 
 ${dirEmoji} ${trade.signal} · ${typeLabel}
@@ -601,6 +602,7 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
 ✅ Trade abgeschlossen.
 ⚡ _Apex Signal Bot_`);
       console.log(`🏆 TP3 HIT: ${trade.signal} ${assetLabel} — geschlossen`);
+      await broker.closeTrade(trade.positionId);
       continue;
     }
 
@@ -632,6 +634,7 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
 ⚡ _Apex Signal Bot_`);
         console.log(`❌ LOSS: ${trade.signal} ${assetLabel}`);
       }
+      await broker.closeTrade(trade.positionId);
       continue;
     }
 
@@ -646,6 +649,7 @@ Trade nach Zeitlimit geschlossen (kein TP/SL erreicht).
 ⚡ _Apex Signal Bot_`);
         console.log(`⏱ TIMEOUT: ${trade.signal} ${assetLabel}`);
       }
+      await broker.closeTrade(trade.positionId);
       continue;
     }
 
@@ -1270,6 +1274,7 @@ const server = http.createServer((req, res) => {
       `XAU/USD Swing-Kerzen: ${swingStore['XAUUSD'].closes.length} ${swingStore['XAUUSD'].closes.length >= swingNeeded ? '✅' : '(sammelt...)'}`,
       `NDX Swing-Kerzen:     ${swingStore['NDX'].closes.length} ${swingStore['NDX'].closes.length >= swingNeeded ? '✅' : '(sammelt...)'}`,
       `💾 Persistenz: ${fs.existsSync(STATE_FILE) ? 'aktiv (' + STATE_FILE + ')' : 'INAKTIV — Volume auf /data mounten!'}`,
+      `🤖 Broker: ${(() => { const s = broker.status(); return `${s.ready ? 'verbunden' : 'nicht verbunden'} · ${s.execute ? 'EXECUTE AN' : 'Dry-Run'} · offen ${s.openCount}/${s.maxOpen}`; })()}`,
       '',
       `Scalp: Cooldown ${CONFIG.COOLDOWN_MIN}min · Bias-Filter ${CONFIG.REQUIRE_BIAS_ALIGN ? 'an' : 'aus'} · Lot ${LOT_SIZE}`,
       `Token gesetzt: ${TOKEN ? 'ja' : 'NEIN ⚠️'}`,
@@ -1410,11 +1415,13 @@ const server = http.createServer((req, res) => {
                   await sendTelegram(buildSwingSignalMsg(
                     sw.signal, assetLabel, sw.cur, sw.sl, sw.tp1, sw.tp2, sw.tp3, sw.rr, sw.rsi, sw.trend
                   ));
-                  openTrades.push({
+                  const swTrade = {
                     symbol: swingKey, signal: sw.signal, entry: sw.cur,
                     sl: sw.sl, tp1: sw.tp1, tp2: sw.tp2, tp3: sw.tp3, rr: sw.rr,
                     type: 'swing', timeoutMin: CONFIG.SWING_TIMEOUT_MIN, openedAt: Date.now(),
-                  });
+                  };
+                  openTrades.push(swTrade);
+                  swTrade.positionId = await broker.openTrade({ sessionKey, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp3, type: 'swing', tag: swingKey });
                   logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: sw.signal, type: 'Swing', grade: null, entry: sw.cur });
                   lastTradeTime[swingKey] = Date.now();
                   console.log(`🟠 Swing (1H aus 1M): ${sw.signal} ${assetLabel} (${sw.trend})`);
@@ -1481,7 +1488,9 @@ const server = http.createServer((req, res) => {
               const rr = (CONFIG.TP1_MULT / CONFIG.SL_MULT).toFixed(2);
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               await sendTelegram(buildOpeningRangeSignalMsg(bo, assetLabel, close, sl, tp1, tp2, tp3, rr, sd.lastBias, trend15m));
-              openTrades.push({ symbol: normSym, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp1, tp2, tp3, rr, type: 'opening_range', openedAt: Date.now() });
+              const orTrade = { symbol: normSym, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp1, tp2, tp3, rr, type: 'opening_range', openedAt: Date.now() };
+              openTrades.push(orTrade);
+              orTrade.positionId = await broker.openTrade({ sessionKey, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp: tp3, type: 'opening_range', tag: normSym });
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: bo, type: 'Opening Range', grade: null, entry: parseFloat(close.toFixed(2)) });
               lastTradeTime[normSym] = Date.now();
               console.log(`🟣 Breakout: ${bo} ${assetLabel}`);
@@ -1510,7 +1519,9 @@ const server = http.createServer((req, res) => {
               st.lastSignal = signalKey;
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp1, result.tp2, result.tp3, result.rr, result.rsi, result.macd, bias, trend15m, result.liqTarget, result.sweptLiquidity, result.grade, result.score, result.factors));
-              openTrades.push({ symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, type: '4confirm', grade: result.grade, openedAt: Date.now() });
+              const scTrade = { symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, type: '4confirm', grade: result.grade, openedAt: Date.now() };
+              openTrades.push(scTrade);
+              scTrade.positionId = await broker.openTrade({ sessionKey, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp3, type: 'scalp', tag: normSym });
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: result.signal, type: 'Scalp', grade: result.grade, entry: result.cur });
               lastTradeTime[normSym] = Date.now();
               console.log(`${result.signal === 'BUY' ? '🟢' : '🔴'} Signal: ${result.signal} ${assetLabel}`);
@@ -1539,6 +1550,7 @@ const server = http.createServer((req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   loadState(); // gespeicherten Swing-Warmup + offene Trades laden (falls Volume vorhanden)
+  broker.init().catch(e => console.warn('Broker init:', e.message)); // MT5-Verbindung aufbauen
   console.log(`🚀 Apex Signal Bot v4 läuft auf Port ${PORT}`);
   console.log(`📊 Config: SL ${CONFIG.SL_MULT}×ATR · TP1/2/3 = ${CONFIG.TP1_MULT}/${CONFIG.TP2_MULT}/${CONFIG.TP3_MULT}×ATR · Lot ${LOT_SIZE} · Swing EMA${CONFIG.SWING_EMA_SLOW}`);
   if (!TOKEN) console.warn('⚠️  BOT_TOKEN nicht gesetzt!');
