@@ -594,6 +594,13 @@ function recordTrade(sd, trade, result, pnl) {
 // Pro Symbol max. 1 offener Trade gleichzeitig → kein Durcheinander
 const openTrades = []; // { symbol, signal, entry, sl, tp, rr, type, openedAt(ms) }
 
+// Signal-Historie fürs Dashboard (letzte 30 gesendete Signale)
+const signalLog = []; // { time, symbol, signal, type, grade, entry }
+function logSignal(entry) {
+  signalLog.unshift(entry);
+  if (signalLog.length > 30) signalLog.pop();
+}
+
 // Cooldown: Zeitpunkt des letzten Trades pro Symbol (verhindert Doppel-Feuern)
 const lastTradeTime = {}; // normSym -> ms
 
@@ -1029,6 +1036,13 @@ td{padding:11px 13px;border-top:1px solid var(--border);font-size:13px}
 .buy{color:var(--green);font-weight:700}.sell{color:var(--red);font-weight:700}
 .muted{color:var(--muted)}.empty{text-align:center;padding:26px;color:var(--muted)}
 .foot{text-align:center;margin-top:20px;font-size:10px;color:var(--muted);opacity:.6}
+.hidden{display:none}
+.stratcard{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:12px}
+.stratrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);font-size:13px}
+.stratrow:last-child{border-bottom:none}
+.stratrow .k{color:var(--muted)}
+.stratrow .v{font-weight:700}
+.sigitem{background:var(--panel);border:1px solid var(--border);border-radius:11px;padding:12px 15px;margin-bottom:7px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
 @media(max-width:680px){
   .side{width:54px;padding:14px 6px}
   .brandname,.brandsub,.navitem span:last-child,.statuspill{display:none}
@@ -1041,44 +1055,129 @@ td{padding:11px 13px;border-top:1px solid var(--border);font-size:13px}
   <div class="side">
     <div class="brand"><div class="logo">⚡</div><div class="brandname">APEX</div></div>
     <div class="brandsub">SIGNAL BOT v4</div>
-    <div class="navitem active"><span class="navi">▦</span><span>Dashboard</span></div>
-    <div class="navitem"><span class="navi">📊</span><span>Positionen</span></div>
-    <div class="navitem"><span class="navi">📡</span><span>Signale</span></div>
-    <div class="navitem"><span class="navi">📈</span><span>Verlauf</span></div>
-    <div class="navitem"><span class="navi">⚙️</span><span>Strategie</span></div>
+    <div class="navitem active" id="nav-dashboard" onclick="nav('dashboard')"><span class="navi">▦</span><span>Dashboard</span></div>
+    <div class="navitem" id="nav-positions" onclick="nav('positions')"><span class="navi">📊</span><span>Positionen</span></div>
+    <div class="navitem" id="nav-signals" onclick="nav('signals')"><span class="navi">📡</span><span>Signale</span></div>
+    <div class="navitem" id="nav-history" onclick="nav('history')"><span class="navi">📈</span><span>Verlauf</span></div>
+    <div class="navitem" id="nav-strategy" onclick="nav('strategy')"><span class="navi">⚙️</span><span>Strategie</span></div>
     <div class="statuspill" id="sidestatus">● ENGINE ONLINE</div>
   </div>
   <div class="main">
     <div class="tophead">
       <div>
-        <div class="h1">Dashboard<span class="eng" id="engtime">· live</span></div>
-        <div class="subtitle">Live-Übersicht deines Portfolios, Signale & Bot-Status</div>
+        <div class="h1" id="pageTitle">Dashboard<span class="eng" id="engtime">· live</span></div>
+        <div class="subtitle" id="pageSub">Live-Übersicht deines Portfolios, Signale & Bot-Status</div>
       </div>
     </div>
-    <div class="tabs">
+
+    <!-- Markt-Tabs (nur auf Dashboard/Verlauf sichtbar) -->
+    <div class="tabs" id="markettabs">
       <div class="tab active" id="tab-combined" onclick="sw('combined')">🌐 Gesamt</div>
       <div class="tab" id="tab-gold" onclick="sw('gold')">🥇 XAU/USD</div>
       <div class="tab" id="tab-ndx" onclick="sw('ndx')">📊 NASDAQ</div>
     </div>
-    <div class="row" id="stats"></div>
-    <div class="equity">
-      <div class="equityhead"><div class="equitytitle">📈 Equity-Kurve <span class="muted" id="eqlabel"></span></div></div>
-      <svg id="eqsvg" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+
+    <!-- SEITE: Dashboard -->
+    <div class="page" id="page-dashboard">
+      <div class="row" id="stats"></div>
+      <div class="equity">
+        <div class="equityhead"><div class="equitytitle">📈 Equity-Kurve <span class="muted" id="eqlabel"></span></div></div>
+        <svg id="eqsvg" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="sect">Offene Positionen</div>
+      <div id="opentrades"></div>
     </div>
-    <div class="sect">Offene Positionen</div>
-    <div id="opentrades"></div>
-    <div class="sect">Letzte Trades · Pips & Geld bei 0.01 Lot</div>
-    <table><thead><tr><th>Zeit</th><th>Richtung</th><th>Ergebnis</th><th>Pips</th><th>Geld</th></tr></thead>
-    <tbody id="history"><tr><td colspan="5" class="empty">Lädt...</td></tr></tbody></table>
+
+    <!-- SEITE: Positionen -->
+    <div class="page hidden" id="page-positions">
+      <div class="sect">Alle offenen Positionen</div>
+      <div id="posList"></div>
+    </div>
+
+    <!-- SEITE: Signale -->
+    <div class="page hidden" id="page-signals">
+      <div class="sect">Letzte Signale (mit Grade)</div>
+      <div id="sigList"></div>
+    </div>
+
+    <!-- SEITE: Verlauf -->
+    <div class="page hidden" id="page-history">
+      <div class="sect">Trade-Historie · Pips & Geld bei 0.01 Lot</div>
+      <table><thead><tr><th>Zeit</th><th>Richtung</th><th>Ergebnis</th><th>Pips</th><th>Geld</th></tr></thead>
+      <tbody id="history"><tr><td colspan="5" class="empty">Lädt...</td></tr></tbody></table>
+    </div>
+
+    <!-- SEITE: Strategie -->
+    <div class="page hidden" id="page-strategy">
+      <div class="sect">Aktuelle Strategie-Einstellungen</div>
+      <div id="stratView"></div>
+    </div>
+
     <div class="foot">Aktualisiert alle 5s · Apex Signal Bot</div>
   </div>
 </div>
 <script>
-let cur='combined', data=null;
+let cur='combined', data=null, page='dashboard';
+const PAGE_INFO={
+  dashboard:['Dashboard','Live-Übersicht deines Portfolios, Signale & Bot-Status',true],
+  positions:['Positionen','Alle aktuell offenen Trades',false],
+  signals:['Signale','Die letzten gesendeten Signale mit Bewertung',false],
+  history:['Verlauf','Deine komplette Trade-Historie',true],
+  strategy:['Strategie','Aktuelle Filter- und Risiko-Einstellungen',false],
+};
+function nav(p){
+  page=p;
+  ['dashboard','positions','signals','history','strategy'].forEach(x=>{
+    document.getElementById('nav-'+x).className='navitem'+(x===p?' active':'');
+    document.getElementById('page-'+x).className='page'+(x===p?'':' hidden');
+  });
+  const info=PAGE_INFO[p];
+  document.getElementById('pageTitle').innerHTML=info[0]+'<span class="eng" id="engtime">· '+(data?data.time:'live')+'</span>';
+  document.getElementById('pageSub').textContent=info[1];
+  // Markt-Tabs nur auf Dashboard & Verlauf zeigen
+  document.getElementById('markettabs').style.display=info[2]?'flex':'none';
+  render();
+}
 function sw(t){cur=t;['combined','gold','ndx'].forEach(x=>document.getElementById('tab-'+x).className='tab'+(x===t?' active':''));render();}
 function card(label,val,cls,sub){return '<div class="card"><div class="clabel">'+label+'</div><div class="cval '+(cls||'')+'">'+val+'</div>'+(sub?'<div class="csub">'+sub+'</div>':'')+'</div>';}
+function gradeTag(g){return g?'<span class="gradeTag '+(g[0]==='A'?'gA':g==='B'?'gB':'gC')+'">'+g+'</span>':'';}
+function renderPositions(){
+  const ot=data.openTrades;
+  document.getElementById('posList').innerHTML=ot.length?ot.map(t=>
+    '<div class="open"><span class="'+(t.signal==='BUY'?'buy':'sell')+'">'+t.signal+' · '+t.symbol+' · '+t.type+gradeTag(t.grade)+'</span><span class="muted">Entry '+t.entry+(t.tp1Hit?' · TP1✅':'')+(t.tp2Hit?' TP2🛡':'')+'</span></div>'
+  ).join(''):'<div class="empty">Keine offenen Positionen</div>';
+}
+function renderSignals(){
+  const s=data.signals||[];
+  document.getElementById('sigList').innerHTML=s.length?s.map(x=>
+    '<div class="sigitem"><span class="'+(x.signal==='BUY'?'buy':'sell')+'">'+x.signal+' · '+x.symbol+gradeTag(x.grade)+'</span><span class="muted">'+x.type+' · '+x.entry+' · '+x.time+'</span></div>'
+  ).join(''):'<div class="empty">Noch keine Signale gesendet</div>';
+}
+function renderStrategy(){
+  const s=data.strategy;if(!s){return;}
+  const r=(k,v)=>'<div class="stratrow"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>';
+  document.getElementById('stratView').innerHTML=
+    '<div class="stratcard"><div class="clabel">Risiko & Ziele</div>'+
+      r('Stop Loss','1.3 × ATR')+r('TP1 / TP2 / TP3',s.tp1+' / '+s.tp2+' / '+s.tp3+' × ATR')+
+      r('Cooldown',s.cooldown+' Min')+r('Min. ATR',s.minAtr+'%')+'</div>'+
+    '<div class="stratcard"><div class="clabel">Session-Filter</div>'+
+      r('Asia (strenger)',s.asia)+r('Abend (strenger)',s.evening)+'</div>'+
+    '<div class="stratcard"><div class="clabel">🥇 Gold-Filter</div>'+
+      r('Min. ATR',s.gold.minAtrPercent+'%')+r('4H-Bias',s.gold.require4hAlign?'✅':'—')+
+      r('5M-Entry',s.gold.require5mAlign?'✅':'—')+r('Liquidität',s.gold.requireLiquidity?'✅':'—')+
+      r('Sweep-Boost',s.gold.sweepBoost?'✅':'—')+'</div>'+
+    '<div class="stratcard"><div class="clabel">📊 NASDAQ-Filter (strenger)</div>'+
+      r('Min. ATR',s.ndx.minAtrPercent+'%')+r('Cooldown',s.ndx.cooldownMin+' Min')+
+      r('15M-Align',s.ndx.require15mAlign?'✅':'—')+r('4H-Bias',s.ndx.require4hAlign?'✅':'—')+
+      r('Liquidität',s.ndx.requireLiquidity?'✅':'—')+'</div>';
+}
 function render(){
   if(!data)return;
+  if(page==='positions'){renderPositions();return;}
+  if(page==='signals'){renderSignals();return;}
+  if(page==='strategy'){renderStrategy();return;}
+  if(page==='history'){renderHistory();return;}
+  // page === dashboard
   if(cur==='combined'){
     const c=data.combined;
     document.getElementById('stats').innerHTML=
@@ -1101,16 +1200,16 @@ function render(){
     drawEquity(d.equity);
     document.getElementById('eqlabel').textContent='· '+(cur==='gold'?'XAU/USD':'NASDAQ');
   }
-  // Offene Trades
+  // Offene Trades (nur die des gewählten Marktes auf dem Dashboard)
   const ot=data.openTrades.filter(t=>cur==='combined'?true:(cur==='gold'?t.symbol.includes('XAU'):t.symbol.includes('NASDAQ')));
   document.getElementById('opentrades').innerHTML=ot.length?ot.map(t=>{
-    const g=t.grade?'<span class="gradeTag '+(t.grade[0]==='A'?'gA':t.grade==='B'?'gB':'gC')+'">'+t.grade+'</span>':'';
-    return '<div class="open"><span class="'+(t.signal==='BUY'?'buy':'sell')+'">'+t.signal+' · '+t.type+g+'</span><span class="muted">Entry '+t.entry+(t.tp1Hit?' · TP1✅':'')+(t.tp2Hit?' TP2🛡':'')+'</span></div>';
+    return '<div class="open"><span class="'+(t.signal==='BUY'?'buy':'sell')+'">'+t.signal+' · '+t.type+gradeTag(t.grade)+'</span><span class="muted">Entry '+t.entry+(t.tp1Hit?' · TP1✅':'')+(t.tp2Hit?' TP2🛡':'')+'</span></div>';
   }).join(''):'<div class="empty">Keine offenen Positionen</div>';
-  // Historie
+}
+function renderHistory(){
   const tr=cur==='combined'?[]:data[cur].trades;
   if(cur==='combined'){
-    document.getElementById('history').innerHTML='<tr><td colspan="5" class="empty">Wähle einen Markt für die Trade-Historie</td></tr>';
+    document.getElementById('history').innerHTML='<tr><td colspan="5" class="empty">Wähle oben einen Markt (XAU/USD oder NASDAQ)</td></tr>';
   } else {
     document.getElementById('history').innerHTML=tr.length?tr.map(t=>'<tr><td class="muted">'+t.time+'</td><td class="'+(t.signal==='BUY'?'buy':'sell')+'">'+t.signal+'</td><td>'+(t.result==='WIN'?'✅ WIN':'❌ LOSS')+'</td><td class="'+(t.pips>=0?'green':'red')+'">'+(t.pips>0?'+':'')+t.pips+'</td><td class="muted">'+(t.money>0?'+':'')+'$'+t.money+'</td></tr>').join(''):'<tr><td colspan="5" class="empty">Noch keine Trades</td></tr>';
   }
@@ -1228,6 +1327,14 @@ const server = http.createServer((req, res) => {
     const payload = {
       time: getBerlinTime(), date: getBerlinDate(),
       openTrades: openTrades.map(t => ({ symbol: getAssetLabel(t.symbol), signal: t.signal, type: t.type, entry: t.entry, grade: t.grade || null, tp1Hit: !!t.tp1Hit, tp2Hit: !!t.tp2Hit })),
+      signals: signalLog.slice(0, 20),
+      strategy: {
+        sl: CONFIG.SL_MULT, tp1: CONFIG.TP1_MULT, tp2: CONFIG.TP2_MULT, tp3: CONFIG.TP3_MULT,
+        cooldown: CONFIG.COOLDOWN_MIN, minAtr: CONFIG.MIN_ATR_PERCENT,
+        asia: `${CONFIG.ASIA_START_MIN/60}:00–${CONFIG.ASIA_END_MIN/60}:00`,
+        evening: `${CONFIG.EVENING_START_MIN/60}:00–${CONFIG.EVENING_END_MIN/60}:00`,
+        ndx: SYMBOL_FILTERS['NDX'], gold: SYMBOL_FILTERS['XAUUSD'],
+      },
       combined: {
         wins: allWins, losses: allLosses,
         winRate: allTotal > 0 ? (allWins / allTotal * 100).toFixed(1) : '0',
@@ -1299,6 +1406,7 @@ const server = http.createServer((req, res) => {
                 st.lastSignal = signalKey;
                 await sendTelegram(buildSwingSignalMsg(sw.signal, assetLabel, sw.cur, sw.sl, sw.tp1, sw.tp2, sw.tp3, sw.rr, sw.rsi, sw.trend));
                 openTrades.push({ symbol: normSym, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp1: sw.tp1, tp2: sw.tp2, tp3: sw.tp3, rr: sw.rr, type: 'swing', timeoutMin: CONFIG.SWING_TIMEOUT_MIN, openedAt: Date.now() });
+                logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: sw.signal, type: 'Swing', grade: null, entry: sw.cur });
                 lastTradeTime[normSym] = Date.now();
                 console.log(`🟠 Swing: ${sw.signal} ${assetLabel} (${sw.trend})`);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1348,6 +1456,7 @@ const server = http.createServer((req, res) => {
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               await sendTelegram(buildOpeningRangeSignalMsg(bo, assetLabel, close, sl, tp1, tp2, tp3, rr, sd.lastBias, trend15m));
               openTrades.push({ symbol: normSym, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp1, tp2, tp3, rr, type: 'opening_range', openedAt: Date.now() });
+              logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: bo, type: 'Opening Range', grade: null, entry: parseFloat(close.toFixed(2)) });
               lastTradeTime[normSym] = Date.now();
               console.log(`🟣 Breakout: ${bo} ${assetLabel}`);
             }
@@ -1377,6 +1486,7 @@ const server = http.createServer((req, res) => {
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp1, result.tp2, result.tp3, result.rr, result.rsi, result.macd, bias, trend15m, result.liqTarget, result.sweptLiquidity, result.grade, result.score, result.factors));
               openTrades.push({ symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, type: '4confirm', grade: result.grade, openedAt: Date.now() });
+              logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: result.signal, type: 'Scalp', grade: result.grade, entry: result.cur });
               lastTradeTime[normSym] = Date.now();
               console.log(`${result.signal === 'BUY' ? '🟢' : '🔴'} Signal: ${result.signal} ${assetLabel}`);
               res.writeHead(200, { 'Content-Type': 'application/json' });
