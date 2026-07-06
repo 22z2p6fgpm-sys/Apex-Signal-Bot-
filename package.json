@@ -1,12 +1,15 @@
 {
   "name": "apex-signal-bot",
-  "version": "1.0.0",
-  "description": "TradingView Webhook → Telegram Signal Bot",
+  "version": "4.0.0",
+  "description": "Apex Signal Bot — TradingView Webhook → Telegram + MT5 Auto-Execution (MetaApi)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
+  },
+  "dependencies": {
+    "metaapi.cloud-sdk": "^29.3.3"
   }
 }
