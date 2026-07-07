@@ -20,6 +20,10 @@ const CONFIG = {
   TP2_MULT: 2.6,
   TP3_MULT: 4.0,
   BREAKEVEN_AFTER_TP2: true,
+  // ── SL-Management: BE bei Mitte TP1↔TP2, danach Trailing ab TP2 ──
+  BE_AT_TP1_TP2_MID: true,   // SL auf Break-Even, sobald Preis die Mitte TP1↔TP2 erreicht
+  TRAIL_AFTER_TP2: true,     // ab TP2 den SL mit dem Kurs mitziehen (Ratsche)
+  TRAIL_ATR_MULT: 1.5,       // Trailing-Abstand = 1.5 × ATR hinter dem Kurs
 
   MAX_CANDLES: 300,
   TRADE_TIMEOUT_MIN: 240, // 4h
@@ -364,6 +368,7 @@ function runStrategy(closes, highs, lows, sessionKey) {
     signal,
     cur: parseFloat(cur.toFixed(2)),
     sl, tp1, tp2, tp3, rr,
+    atr: atrV,
     rsi: rv.toFixed(1),
     macd: mn.toFixed(3),
     liqTarget: liqTarget ? parseFloat(liqTarget.toFixed(2)) : null,
@@ -408,6 +413,7 @@ function runSwingStrategy(closes, highs, lows) {
     signal,
     cur: parseFloat(cur.toFixed(2)),
     sl, tp1, tp2, tp3, rr,
+    atr: atrV,
     rsi: rv.toFixed(1),
     trend: uptrend ? 'Aufwärtstrend' : 'Abwärtstrend',
   };
@@ -542,6 +548,12 @@ function inCooldown(normSym) {
   return (Date.now() - last) < cooldownMin * 60 * 1000;
 }
 
+// Übersetzt ein TradingView-Preislevel in das Broker-Preisniveau (gleicher Versatz
+// wie beim Einstieg). So sitzen BE/Trailing beim Broker korrekt, trotz Preis-Versatz.
+function brokerLevel(trade, tvLevel) {
+  return (trade.brokerEntry != null) ? trade.brokerEntry + (tvLevel - trade.entry) : tvLevel;
+}
+
 async function checkOpenTrades(symbol, high, low) {
   const sessionKey = getSessionKey(symbol);
   const assetLabel = getAssetLabel(symbol);
@@ -553,8 +565,7 @@ async function checkOpenTrades(symbol, high, low) {
     if (trade.symbol !== symbol) { remaining.push(trade); continue; }
 
     const isBuy = trade.signal === 'BUY';
-    const typeLabel = trade.type === 'opening_range' ? 'Opening Range' : trade.type === 'swing' ? '🟠 Swing' : '4-Confirm';
-    const dirEmoji = isBuy ? '📈' : '📉';
+    const tl = trade.type === 'opening_range' ? 'Range' : trade.type === 'swing' ? 'Swing' : 'Scalp';
     const reached = (level) => isBuy ? high >= level : low <= level;
 
     if (!trade.tp1Hit && reached(trade.tp1)) {
@@ -563,44 +574,61 @@ async function checkOpenTrades(symbol, high, low) {
       if (sd) recordTrade(sd, trade, 'WIN', pnl);
       const total = sd ? sd.performance.wins + sd.performance.losses : 0;
       const winRate = total > 0 ? ((sd.performance.wins / total) * 100).toFixed(1) : '0';
-      await sendTelegram(`🎯 *TP1 HIT — ${assetLabel}* ✅
-
-${dirEmoji} ${trade.signal} · ${typeLabel}
-💰 Entry: \`${trade.entry.toFixed(2)}\`
-🎯 TP1 erreicht: \`${trade.tp1.toFixed(2)}\`
-💵 +\`${fmtPnl(sessionKey, Math.abs(trade.tp1 - trade.entry))}\` gesichert
-
-✅ *Trade zählt als WIN!* Läuft weiter Richtung TP2.
-🔜 Nächstes Ziel: \`${trade.tp2.toFixed(2)}\`
-
-🔥 Serie: \`${sd ? sd.performance.streak : 0}× ${sd ? (sd.performance.streakType || '-') : '-'}\`
-📊 Heute: \`${sd ? sd.performance.wins : 0}W / ${sd ? sd.performance.losses : 0}L\` · Win-Rate \`${winRate}%\`
-⚡ _Apex Signal Bot_`);
+      await sendTelegram(`✅ *TP1 · ${assetLabel}* — WIN gesichert
+${trade.signal} · ${tl}
++${fmtPnl(sessionKey, Math.abs(trade.tp1 - trade.entry))}
+Nächstes Ziel ${trade.tp2.toFixed(2)}
+Heute ${sd ? sd.performance.wins : 0}W/${sd ? sd.performance.losses : 0}L · ${winRate}% · Serie ${sd ? sd.performance.streak : 0}×
+_Apex_`);
       console.log(`🎯 TP1 HIT: ${trade.signal} ${assetLabel}`);
     }
 
+    // ── Break-Even, sobald der Preis die Mitte zwischen TP1 und TP2 erreicht ──
+    if (CONFIG.BE_AT_TP1_TP2_MID && !trade.beMoved) {
+      const beTrigger = (trade.tp1 + trade.tp2) / 2;
+      if (reached(beTrigger)) {
+        trade.beMoved = true;
+        trade.sl = trade.entry;
+        await broker.moveToBreakeven(trade.positionId, brokerLevel(trade, trade.entry), brokerLevel(trade, trade.tp3));
+        await sendTelegram(`🔒 *Break-Even · ${assetLabel}*
+${trade.signal} · ${tl} — SL auf Entry ${trade.entry.toFixed(2)}
+Ab hier läuft der Trade risikofrei.
+_Apex_`);
+        console.log(`🛡 BE (Mitte TP1/TP2): ${trade.signal} ${assetLabel}`);
+      }
+    }
+
+    // ── TP2: Trailing aktivieren ──
     if (trade.tp1Hit && !trade.tp2Hit && reached(trade.tp2)) {
       trade.tp2Hit = true;
-      if (CONFIG.BREAKEVEN_AFTER_TP2) { trade.sl = trade.entry; await broker.moveToBreakeven(trade.positionId, trade.entry, trade.tp3); }
-      await sendTelegram(`🎯 *TP2 HIT — ${assetLabel}* ✅
+      trade.trailing = CONFIG.TRAIL_AFTER_TP2;
+      if (!trade.beMoved) { trade.beMoved = true; trade.sl = trade.entry; await broker.moveToBreakeven(trade.positionId, brokerLevel(trade, trade.entry), brokerLevel(trade, trade.tp3)); }
+      await sendTelegram(`✅ *TP2 · ${assetLabel}*
+${trade.signal} · ${tl}
++${fmtPnl(sessionKey, Math.abs(trade.tp2 - trade.entry))}${CONFIG.TRAIL_AFTER_TP2 ? `\n📈 Trailing aktiv · SL folgt ${CONFIG.TRAIL_ATR_MULT}×ATR` : ''}
+Letztes Ziel ${trade.tp3.toFixed(2)}
+_Apex_`);
+      console.log(`🎯 TP2 HIT: ${trade.signal} ${assetLabel} → Trailing an`);
+    }
 
-${dirEmoji} ${trade.signal} · ${typeLabel}
-🎯 TP2 erreicht: \`${trade.tp2.toFixed(2)}\`
-💵 +\`${fmtPnl(sessionKey, Math.abs(trade.tp2 - trade.entry))}\`
-${CONFIG.BREAKEVEN_AFTER_TP2 ? '🛡 *SL jetzt auf Break-Even* — Rest läuft risikofrei!' : ''}
-🔜 Letztes Ziel: \`${trade.tp3.toFixed(2)}\`
-⚡ _Apex Signal Bot_`);
-      console.log(`🎯 TP2 HIT: ${trade.signal} ${assetLabel} → Break-Even`);
+    // ── Trailing-Update (Ratsche): SL nur in Gewinnrichtung nachziehen ──
+    if (trade.trailing && trade.atr) {
+      const dist = trade.atr * CONFIG.TRAIL_ATR_MULT;
+      const cand = parseFloat((isBuy ? high - dist : low + dist).toFixed(2));
+      const better = isBuy ? cand > trade.sl : cand < trade.sl;
+      if (better) {
+        trade.sl = cand;
+        await broker.modifyStop(trade.positionId, brokerLevel(trade, cand), brokerLevel(trade, trade.tp3));
+        console.log(`📈 Trailing SL → ${cand} (${trade.signal} ${assetLabel})`);
+      }
     }
 
     if (trade.tp2Hit && reached(trade.tp3)) {
-      await sendTelegram(`🎯 *TP3 HIT — ${assetLabel}* 🏆
-
-${dirEmoji} ${trade.signal} · ${typeLabel}
-🎯 TP3 erreicht: \`${trade.tp3.toFixed(2)}\`
-💵 +\`${fmtPnl(sessionKey, Math.abs(trade.tp3 - trade.entry))}\` — *voll durchgelaufen!* 🚀
-✅ Trade abgeschlossen.
-⚡ _Apex Signal Bot_`);
+      await sendTelegram(`🏆 *TP3 · ${assetLabel}* — voll durchgelaufen
+${trade.signal} · ${tl}
++${fmtPnl(sessionKey, Math.abs(trade.tp3 - trade.entry))}
+Trade abgeschlossen.
+_Apex_`);
       console.log(`🏆 TP3 HIT: ${trade.signal} ${assetLabel} — geschlossen`);
       await broker.closeTrade(trade.positionId);
       continue;
@@ -608,30 +636,28 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
 
     const slHit = isBuy ? low <= trade.sl : high >= trade.sl;
     if (slHit) {
-      const atBreakeven = trade.tp1Hit && trade.sl === trade.entry;
-      if (atBreakeven) {
-        await sendTelegram(`🛡 *BREAK-EVEN STOP — ${assetLabel}*
-
-${dirEmoji} ${trade.signal} · ${typeLabel}
-Position bei Entry \`${trade.entry.toFixed(2)}\` geschlossen.
-✅ Gewinne aus TP1${trade.tp2Hit ? '/TP2' : ''} sind gesichert — kein Verlust.
-⚡ _Apex Signal Bot_`);
-        console.log(`🛡 Break-Even Stop: ${trade.signal} ${assetLabel}`);
+      const inProfit = isBuy ? trade.sl >= trade.entry : trade.sl <= trade.entry;
+      if (inProfit && trade.tp1Hit) {
+        // Break-Even- oder Trailing-Stop → Gewinn gesichert, kein Verlust
+        const atBE = Math.abs(trade.sl - trade.entry) < 1e-9;
+        const locked = Math.abs(trade.sl - trade.entry);
+        await sendTelegram(`🛡 *${atBE ? 'Break-Even Stop' : 'Trailing Stop'} · ${assetLabel}*
+${trade.signal} · ${tl} — zu bei ${trade.sl.toFixed(2)}
+${atBE
+  ? `Kein Verlust — Gewinne aus TP1${trade.tp2Hit ? '/TP2' : ''} gesichert.`
+  : `+${fmtPnl(sessionKey, locked)} über Entry gesichert.`}
+_Apex_`);
+        console.log(`🛡 ${atBE ? 'BE' : 'Trailing'} Stop: ${trade.signal} ${assetLabel}`);
       } else {
         const pnl = -Math.abs(trade.entry - trade.sl);
         if (sd && !trade.tp1Hit) recordTrade(sd, trade, 'LOSS', pnl);
         const total = sd ? sd.performance.wins + sd.performance.losses : 0;
         const winRate = total > 0 ? ((sd.performance.wins / total) * 100).toFixed(1) : '0';
-        await sendTelegram(`❌ *TRADE LOSS — ${assetLabel}*
-
-${dirEmoji} ${trade.signal} · ${typeLabel}
-💰 Entry: \`${trade.entry.toFixed(2)}\`
-🛑 SL erreicht: \`${trade.sl.toFixed(2)}\`
-💵 \`${fmtPnl(sessionKey, -Math.abs(trade.entry - trade.sl))}\`
-
-🔥 Serie: \`${sd ? sd.performance.streak : 0}× ${sd ? (sd.performance.streakType || '-') : '-'}\`
-📊 Heute: \`${sd ? sd.performance.wins : 0}W / ${sd ? sd.performance.losses : 0}L\` · Win-Rate \`${winRate}%\`
-⚡ _Apex Signal Bot_`);
+        await sendTelegram(`❌ *Loss · ${assetLabel}*
+${trade.signal} · ${tl} — Entry ${trade.entry.toFixed(2)} → SL ${trade.sl.toFixed(2)}
+${fmtPnl(sessionKey, -Math.abs(trade.entry - trade.sl))}
+Heute ${sd ? sd.performance.wins : 0}W/${sd ? sd.performance.losses : 0}L · ${winRate}% · Serie ${sd ? sd.performance.streak : 0}×
+_Apex_`);
         console.log(`❌ LOSS: ${trade.signal} ${assetLabel}`);
       }
       await broker.closeTrade(trade.positionId);
@@ -641,12 +667,10 @@ ${dirEmoji} ${trade.signal} · ${typeLabel}
     const timeoutMin = trade.timeoutMin || CONFIG.TRADE_TIMEOUT_MIN;
     if ((now - trade.openedAt) > timeoutMin * 60 * 1000) {
       if (!trade.tp1Hit) {
-        await sendTelegram(`⏱ *TIMEOUT — ${assetLabel}*
-
-${dirEmoji} ${trade.signal} · ${typeLabel}
-Trade nach Zeitlimit geschlossen (kein TP/SL erreicht).
-💰 Entry war \`${trade.entry.toFixed(2)}\`
-⚡ _Apex Signal Bot_`);
+        await sendTelegram(`⌛ *Timeout · ${assetLabel}*
+${trade.signal} · ${tl} — nach Zeitlimit geschlossen
+Entry war ${trade.entry.toFixed(2)}
+_Apex_`);
         console.log(`⏱ TIMEOUT: ${trade.signal} ${assetLabel}`);
       }
       await broker.closeTrade(trade.positionId);
@@ -686,142 +710,105 @@ function sendTelegram(msg) {
 }
 
 // ─── NACHRICHTEN ──────────────────────────────────────────────────────────────
-function biasTag(bias, signal) {
-  if (!bias || bias === 'WATCH' || bias === 'NEUTRAL') return '';
-  return bias === signal ? '\n✅ *Mit Daily Bias* — starkes Signal!' : '\n⚠️ *HIGH RISK* — gegen Daily Bias!';
+// ── Clean-Layout-Helfer ──────────────────────────────────────────────────────
+function block(lines) { return '```\n' + lines.join('\n') + '\n```'; }
+function prow(label, value, suffix) {
+  const v = (typeof value === 'number') ? value.toFixed(2) : String(value);
+  return label.padEnd(7) + v.padStart(11) + (suffix ? '  ' + suffix : '');
 }
-function tf15Tag(trend15m, signal) {
-  if (!trend15m) return '• 15M Trend: neutral';
-  return trend15m === signal ? '• ✅ 15M Trend bestätigt' : '• ⚠️ Gegen 15M Trend';
+function rLabel(entry, sl, tp) {
+  const risk = Math.abs(entry - sl);
+  if (!risk) return '';
+  return '+' + (Math.abs(tp - entry) / risk).toFixed(1) + 'R';
+}
+function biasLine(bias, signal) {
+  if (!bias || bias === 'WATCH' || bias === 'NEUTRAL') return '';
+  return bias === signal ? '\n✅ mit Daily Bias' : '\n⚠️ gegen Daily Bias';
 }
 
 function buildMorningMsg() {
-  return `☀️ *GUTEN MORGEN!*
+  return `☀️ *Guten Morgen*
+_${getBerlinDate()}_
 
-✅ Apex Signal Bot ist *aktiv* und überwacht die Märkte.
-🗓 ${getBerlinDate()}
+Bot aktiv · überwacht XAU/USD & NASDAQ
+Scalp + Swing · Auto-Trading
 
-📡 *Heute im Blick:*
-• XAU/USD (Gold) — Scalp & Swing
-• NASDAQ 100 — Scalp & Swing
-
-🔵 Daily Bias kommt um *15:30*
-🟣 Opening Range um *15:45*
-📊 Tages-Report um *22:00*
-
-_Auf einen profitablen Tag!_ 💪
-⚡ _Apex Signal Bot_`;
+🕐 Bias 15:30 · Range 15:45 · Report 22:00
+_Apex_`;
 }
 
 function buildBiasMsg(asset, bias, reason, asiaHigh, asiaLow) {
-  const t = bias === 'BUY' ? '📈 BULLISH' : bias === 'SELL' ? '📉 BEARISH' : bias === 'WATCH' ? '👀 WATCH' : '➡️ NEUTRAL';
-  return `🔵 *DAILY BIAS — ${asset}*
+  const t = bias === 'BUY' ? 'Long 📈' : bias === 'SELL' ? 'Short 📉' : bias === 'WATCH' ? 'Watch 👀' : 'Neutral';
+  return `🧭 *Daily Bias · ${asset}*
+Richtung: *${t}*
 
-📊 *Richtung:* ${t}
-🗓 ${getBerlinDate()}
+${block([prow('Asia H', asiaHigh), prow('Asia L', asiaLow)])}
+${reason}
 
-🌏 *Asia Range:*
-• High: \`${asiaHigh.toFixed(2)}\`
-• Low:  \`${asiaLow.toFixed(2)}\`
-
-💡 ${reason}
-
-⏰ _NYC Session startet!_
-⚡ _Apex Signal Bot_`;
+_${getBerlinDate()} · Apex_`;
 }
 
 function buildOpeningRangeMsg(asset, high, low) {
-  return `🟣 *NYC OPENING RANGE — ${asset}*
+  return `🎯 *Opening Range · ${asset}*
 
-📐 High: \`${high.toFixed(2)}\`
-📐 Low:  \`${low.toFixed(2)}\`
-📏 Größe: \`${(high - low).toFixed(2)} pts\`
-
-⏳ _Warte auf Ausbruch..._
-🕐 _${getBerlinTime()}_
-⚡ _Apex Signal Bot_`;
+${block([prow('High', high), prow('Low', low), prow('Größe', high - low)])}
+_Warte auf Ausbruch · ${getBerlinTime()}_`;
 }
 
 function buildOpeningRangeSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, bias, trend15m) {
-  const dir = signal === 'BUY' ? '📈' : '📉';
-  return `🟣 *OPENING RANGE BREAKOUT — ${asset}* ${dir}${biasTag(bias, signal)}
+  const emoji = signal === 'BUY' ? '🟢' : '🔴';
+  const trend = trend15m ? (trend15m === signal ? '15M ✓' : '15M ✗') : '15M –';
+  return `${emoji} *${signal} · ${asset} · Range Breakout*${biasLine(bias, signal)}
 
-💰 *Entry:*     \`${entry.toFixed(2)}\`
-🛑 *Stop Loss:* \`${sl.toFixed(2)}\`
-
-🎯 *TP1:* \`${tp1.toFixed(2)}\`  _(= WIN, sichern)_
-🎯 *TP2:* \`${tp2.toFixed(2)}\`  _(→ Break-Even)_
-🎯 *TP3:* \`${tp3.toFixed(2)}\`  _(Runner)_
-⚖️ *R:R (bis TP1):* \`1 : ${rr}\`
-
-📊 ${tf15Tag(trend15m, signal)}
-
-🕐 _${getBerlinTime()}_
-⚡ _Apex Signal Bot — Opening Range_`;
+${block([
+  prow('Entry', entry),
+  prow('SL', sl),
+  prow('TP1', tp1, rLabel(entry, sl, tp1)),
+  prow('TP2', tp2, rLabel(entry, sl, tp2)),
+  prow('TP3', tp3, rLabel(entry, sl, tp3)),
+])}
+📊 R:R 1:${rr} · ${trend}
+🕐 ${getBerlinTime()} · _Apex_`;
 }
 
 function buildSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, rsi, macd, bias, trend15m, liqTarget, swept, grade, score, factors) {
   const emoji = signal === 'BUY' ? '🟢' : '🔴';
-  const dir = signal === 'BUY' ? '📈' : '📉';
-  const liqLine = liqTarget ? `\n💧 *Liquiditäts-Ziel:* \`${liqTarget.toFixed(2)}\`` : '';
-  const sweepLine = swept ? `\n🎯 *Liquidity Sweep erkannt!* _(Stop-Hunt + Umkehr — starkes Setup)_` : '';
-
-  let gradeBox = '';
+  const gradeStr = factors ? ` · ${grade}` : '';
+  const sweepStr = swept ? '\n🎯 Liquidity Sweep' : '';
+  let factorLine = '';
   if (factors) {
-    const chk = (b) => b ? '✅' : '⬜️';
-    const gradeEmoji = grade === 'A+' ? '🏆' : grade === 'A' ? '⭐️' : grade === 'B' ? '👍' : '⚠️';
-    gradeBox = `
-
-${gradeEmoji} *Setup-Grade: ${grade}* _(${score}/6)_
-${chk(factors.sweep)} Liquidity Sweep
-${chk(factors.liquidity)} Klares Ziel
-${chk(factors.biasAlign)} 4H Bias
-${chk(factors.entryAlign)} 15M Entry
-${chk(factors.fvg)} Fair Value Gap
-${chk(factors.strongCandle)} Starke Kerze`;
+    const c = (b) => (b ? '✓' : '·');
+    factorLine = `\n🏅 ${grade} (${score}/6) · Sweep${c(factors.sweep)} Ziel${c(factors.liquidity)} 4H${c(factors.biasAlign)} 15M${c(factors.entryAlign)} FVG${c(factors.fvg)} Kerze${c(factors.strongCandle)}`;
   }
+  const liqStr = liqTarget ? `\n💧 Ziel-Liquidität ${liqTarget.toFixed(2)}` : '';
 
-  return `${emoji} *${signal} NOW* — ${asset} ${dir}${biasTag(bias, signal)}${sweepLine}${gradeBox}
+  return `${emoji} *${signal} · ${asset} · Scalp${gradeStr}*${biasLine(bias, signal)}${sweepStr}
 
-💰 *Entry:*     \`${entry.toFixed(2)}\`
-🛑 *Stop Loss:* \`${sl.toFixed(2)}\`
-
-🎯 *TP1:* \`${tp1.toFixed(2)}\`  _(= WIN, sichern)_
-🎯 *TP2:* \`${tp2.toFixed(2)}\`  _(→ Break-Even)_
-🎯 *TP3:* \`${tp3.toFixed(2)}\`  _(Runner)_
-⚖️ *R:R (bis TP1):* \`1 : ${rr}\`${liqLine}
-
-📊 *Indikatoren:*
-• RSI 14: \`${rsi}\`
-• MACD: \`${macd}\`
-${tf15Tag(trend15m, signal)}
-
-🕐 _${getBerlinTime()} — ${getBerlinDate()}_
-⚡ _Apex Signal Bot — Conservative Scalp_`;
+${block([
+  prow('Entry', entry),
+  prow('SL', sl),
+  prow('TP1', tp1, rLabel(entry, sl, tp1)),
+  prow('TP2', tp2, rLabel(entry, sl, tp2)),
+  prow('TP3', tp3, rLabel(entry, sl, tp3)),
+])}${factorLine}
+📊 RSI ${rsi} · MACD ${macd} · R:R 1:${rr}${liqStr}
+🕐 ${getBerlinTime()} · _Apex_`;
 }
 
 function buildSwingSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, rsi, trend) {
-  const dir = signal === 'BUY' ? '📈' : '📉';
-  return `🟠 *SWING ${signal}* — ${asset} ${dir}
+  const emoji = signal === 'BUY' ? '🟢' : '🔴';
+  return `${emoji} *${signal} · ${asset} · Swing*
+_Trend + Pullback · Haltedauer Std–1 Tag_
 
-⏳ _Haltedauer: Stunden bis 1 Tag · 1H Chart_
-📐 _Setup: Trend-Following + Pullback_
-
-💰 *Entry:*     \`${entry.toFixed(2)}\`
-🛑 *Stop Loss:* \`${sl.toFixed(2)}\`
-
-🎯 *TP1:* \`${tp1.toFixed(2)}\`  _(= WIN, sichern)_
-🎯 *TP2:* \`${tp2.toFixed(2)}\`  _(→ Break-Even)_
-🎯 *TP3:* \`${tp3.toFixed(2)}\`  _(Runner)_
-⚖️ *R:R (bis TP1):* \`1 : ${rr}\`
-
-📊 *Analyse (1H):*
-• Trend: \`${trend}\`
-• RSI 14: \`${rsi}\`
-• Pullback zur EMA20 ✅
-
-🕐 _${getBerlinTime()} — ${getBerlinDate()}_
-⚡ _Apex Signal Bot — Swing Trade_`;
+${block([
+  prow('Entry', entry),
+  prow('SL', sl),
+  prow('TP1', tp1, rLabel(entry, sl, tp1)),
+  prow('TP2', tp2, rLabel(entry, sl, tp2)),
+  prow('TP3', tp3, rLabel(entry, sl, tp3)),
+])}
+📊 ${trend} · RSI ${rsi} · R:R 1:${rr}
+🕐 ${getBerlinTime()} · _Apex_`;
 }
 
 function buildPerformanceReport(asset, perf, sessionKey) {
@@ -829,29 +816,26 @@ function buildPerformanceReport(asset, perf, sessionKey) {
   const winRate = total > 0 ? ((perf.wins / total) * 100).toFixed(1) : '0';
   const totalPnlPrice = perf.trades.reduce((a, t) => a + t.pnl, 0);
   const totalFmt = fmtPnl(sessionKey, totalPnlPrice);
-  const se = perf.streakType === 'WIN' ? '🔥' : perf.streakType === 'LOSS' ? '❄️' : '➡️';
+  const se = perf.streakType === 'WIN' ? '🔥' : perf.streakType === 'LOSS' ? '🧊' : '·';
   const last = perf.trades.slice(-5).map(t => {
     const { pips } = toPipsAndMoney(sessionKey, t.pnl);
-    return `${t.result === 'WIN' ? '✅' : '❌'} ${t.signal} · ${pips > 0 ? '+' : ''}${pips.toFixed(1)} Pips`;
-  }).join('\n') || 'Keine abgeschlossenen Trades heute';
+    return `${t.result === 'WIN' ? '✅' : '❌'} ${t.signal} ${pips > 0 ? '+' : ''}${pips.toFixed(1)}`;
+  }).join('\n') || '–';
 
-  return `📊 *TAGES-REPORT — ${asset}*
-🗓 ${getBerlinDate()}
+  return `📊 *Tages-Report · ${asset}*
+_${getBerlinDate()}_
 
-*Performance:*
-✅ Wins: \`${perf.wins}\`  ❌ Losses: \`${perf.losses}\`
-📈 Win-Rate: \`${winRate}%\`
-💰 Total: \`${totalFmt}\`
+${block([
+  prow('Wins', String(perf.wins)),
+  prow('Losses', String(perf.losses)),
+  prow('Win-Rate', winRate + '%'),
+])}
+💰 Total ${totalFmt}
+${se} Serie ${perf.streak}× ${perf.streakType || '-'} · Best ${perf.bestStreak}× · Worst ${perf.worstStreak}×
 
-*Streak:*
-${se} Aktuell: \`${perf.streak}× ${perf.streakType || '-'}\`
-🏆 Beste Win-Serie: \`${perf.bestStreak}×\`
-📉 Schlimmste Loss-Serie: \`${perf.worstStreak}×\`
-
-*Letzte Trades:*
+Letzte Trades:
 ${last}
-
-⚡ _Apex Signal Bot — Daily Report_`;
+_Apex_`;
 }
 
 // ─── STORE & SYMBOL MAPPING ────────────────────────────────────────────────────
@@ -1417,11 +1401,12 @@ const server = http.createServer((req, res) => {
                   ));
                   const swTrade = {
                     symbol: swingKey, signal: sw.signal, entry: sw.cur,
-                    sl: sw.sl, tp1: sw.tp1, tp2: sw.tp2, tp3: sw.tp3, rr: sw.rr,
+                    sl: sw.sl, tp1: sw.tp1, tp2: sw.tp2, tp3: sw.tp3, rr: sw.rr, atr: sw.atr,
                     type: 'swing', timeoutMin: CONFIG.SWING_TIMEOUT_MIN, openedAt: Date.now(),
                   };
                   openTrades.push(swTrade);
-                  swTrade.positionId = await broker.openTrade({ sessionKey, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp3, type: 'swing', tag: swingKey });
+                  const swEx = await broker.openTrade({ sessionKey, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp3, type: 'swing', tag: swingKey });
+                  if (swEx) { swTrade.positionId = swEx.positionId; swTrade.brokerEntry = swEx.brokerEntry; }
                   logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: sw.signal, type: 'Swing', grade: null, entry: sw.cur });
                   lastTradeTime[swingKey] = Date.now();
                   console.log(`🟠 Swing (1H aus 1M): ${sw.signal} ${assetLabel} (${sw.trend})`);
@@ -1488,9 +1473,10 @@ const server = http.createServer((req, res) => {
               const rr = (CONFIG.TP1_MULT / CONFIG.SL_MULT).toFixed(2);
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               await sendTelegram(buildOpeningRangeSignalMsg(bo, assetLabel, close, sl, tp1, tp2, tp3, rr, sd.lastBias, trend15m));
-              const orTrade = { symbol: normSym, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp1, tp2, tp3, rr, type: 'opening_range', openedAt: Date.now() };
+              const orTrade = { symbol: normSym, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp1, tp2, tp3, rr, atr: atrV, type: 'opening_range', openedAt: Date.now() };
               openTrades.push(orTrade);
-              orTrade.positionId = await broker.openTrade({ sessionKey, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp: tp3, type: 'opening_range', tag: normSym });
+              const orEx = await broker.openTrade({ sessionKey, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp: tp3, type: 'opening_range', tag: normSym });
+              if (orEx) { orTrade.positionId = orEx.positionId; orTrade.brokerEntry = orEx.brokerEntry; }
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: bo, type: 'Opening Range', grade: null, entry: parseFloat(close.toFixed(2)) });
               lastTradeTime[normSym] = Date.now();
               console.log(`🟣 Breakout: ${bo} ${assetLabel}`);
@@ -1519,9 +1505,10 @@ const server = http.createServer((req, res) => {
               st.lastSignal = signalKey;
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp1, result.tp2, result.tp3, result.rr, result.rsi, result.macd, bias, trend15m, result.liqTarget, result.sweptLiquidity, result.grade, result.score, result.factors));
-              const scTrade = { symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, type: '4confirm', grade: result.grade, openedAt: Date.now() };
+              const scTrade = { symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, atr: result.atr, type: '4confirm', grade: result.grade, openedAt: Date.now() };
               openTrades.push(scTrade);
-              scTrade.positionId = await broker.openTrade({ sessionKey, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp3, type: 'scalp', tag: normSym });
+              const scEx = await broker.openTrade({ sessionKey, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp3, type: 'scalp', tag: normSym });
+              if (scEx) { scTrade.positionId = scEx.positionId; scTrade.brokerEntry = scEx.brokerEntry; }
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: result.signal, type: 'Scalp', grade: result.grade, entry: result.cur });
               lastTradeTime[normSym] = Date.now();
               console.log(`${result.signal === 'BUY' ? '🟢' : '🔴'} Signal: ${result.signal} ${assetLabel}`);
