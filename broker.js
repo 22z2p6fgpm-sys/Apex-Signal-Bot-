@@ -48,7 +48,10 @@ async function init() {
   try {
     // Lazy-Require: Bot läuft auch ohne installiertes SDK weiter (nur ohne Trading)
     const MetaApi = require('metaapi.cloud-sdk').default;
-    const api = new MetaApi(TOKEN);
+    // Region MUSS angegeben werden (bei Kontoerstellung gewählt: 'london'),
+    // sonst subscribe-TimeoutError + ständige Reconnects. Per Env überschreibbar.
+    const REGION = process.env.METAAPI_REGION || 'london';
+    const api = new MetaApi(TOKEN, { region: REGION });
     const account = await api.metatraderAccountApi.getAccount(ACCOUNT_ID);
     await account.deploy().catch(() => {}); // idempotent — falls schon deployed
     await account.waitConnected();
@@ -57,7 +60,7 @@ async function init() {
     await connection.waitSynchronized();
     ready = true;
     const info = await connection.getAccountInformation().catch(() => null);
-    console.log(`✅ Broker verbunden (MT5). EXECUTE_TRADES=${EXECUTE ? 'AN — es wird geordert!' : 'aus (Dry-Run)'}` +
+    console.log(`✅ Broker verbunden (MT5, Region ${REGION}). EXECUTE_TRADES=${EXECUTE ? 'AN — es wird geordert!' : 'aus (Dry-Run)'}` +
       (info ? ` · Balance ${info.balance} ${info.currency}` : ''));
   } catch (e) {
     console.warn('⚠️ Broker-Init fehlgeschlagen → Ausführung deaktiviert:', e.message);
