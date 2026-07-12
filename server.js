@@ -737,10 +737,16 @@ function buildMorningMsg() {
   return `☀️ *Guten Morgen*
 _${getBerlinDate()}_
 
-Bot aktiv · überwacht XAU/USD & NASDAQ
-Scalp + Swing · Auto-Trading
+📡 *Überwacht*
+XAU/USD · NASDAQ 100
+Scalp + Swing · Auto-Trading aktiv
 
-🕐 Bias 15:30 · Range 15:45 · Report 22:00
+🕐 *Heute*
+${block([
+  'Bias      15:30',
+  'Range     15:45',
+  'Report    22:00',
+])}
 _Apex_`;
 }
 
