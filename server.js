@@ -31,7 +31,8 @@ const CONFIG = {
   RSI_SELL: [35, 55],
 
   // ── Qualitäts-Filter ──
-  COOLDOWN_MIN: 15,
+  REQUIRE_EMA_CROSS: false,  // false = EMA-Zustand statt Cross-Ereignis (deutlich mehr Signale)
+  COOLDOWN_MIN: 0,           // 0 = kein Cooldown (nur 1 offener Trade pro Symbol begrenzt)
   MIN_ATR_PERCENT: 0.04,
   REQUIRE_BIAS_ALIGN: true,
 
@@ -66,7 +67,7 @@ const SYMBOL_FILTERS = {
     minAtrPercent: 0.10,
     rsiBuy: [50, 62],
     rsiSell: [38, 50],
-    cooldownMin: 30,
+    cooldownMin: 0,
     requireBiasAlign: true,
     require15mAlign: true,
     require4hAlign: true,
@@ -271,6 +272,12 @@ function runStrategy(closes, highs, lows, sessionKey) {
   const crossUp = e12p <= e26p && e12n > e26n;
   const crossDown = e12p >= e26p && e12n < e26n;
 
+  // Gelockerte Variante: EMA-ZUSTAND statt Cross-Ereignis.
+  // REQUIRE_EMA_CROSS=true  → nur exakt in der Cross-Minute (sehr selten)
+  // REQUIRE_EMA_CROSS=false → immer wenn EMA12 über/unter EMA26 liegt (viel mehr Signale)
+  const emaBull = CONFIG.REQUIRE_EMA_CROSS ? crossUp   : (e12n > e26n);
+  const emaBear = CONFIG.REQUIRE_EMA_CROSS ? crossDown : (e12n < e26n);
+
   const rv = rsiCalc(closes);
   if (rv === null) return null;
   let rsiBuyRange = filt.rsiBuy, rsiSellRange = filt.rsiSell;
@@ -295,8 +302,8 @@ function runStrategy(closes, highs, lows, sessionKey) {
   else if (isEvening) minAtr = Math.max(CONFIG.EVENING_MIN_ATR_PERCENT, filt.minAtrPercent);
   if (atrPercent < minAtr) return null;
 
-  const buyS = crossUp && rsiBuy && mBull && cur > s50;
-  const sellS = crossDown && rsiSell && mBear && cur < s50;
+  const buyS = emaBull && rsiBuy && mBull && cur > s50;
+  const sellS = emaBear && rsiSell && mBear && cur < s50;
   if (!buyS && !sellS) return null;
 
   const signal = buyS ? 'BUY' : 'SELL';
@@ -1260,7 +1267,7 @@ const server = http.createServer((req, res) => {
       `💾 Persistenz: ${fs.existsSync(STATE_FILE) ? 'aktiv (' + STATE_FILE + ')' : 'INAKTIV — Volume auf /data mounten!'}`,
       `🤖 Broker: ${(() => { const s = broker.status(); return `${s.ready ? 'verbunden' : 'nicht verbunden'} · ${s.execute ? 'EXECUTE AN' : 'Dry-Run'} · offen ${s.openCount}/${s.maxOpen}`; })()}`,
       '',
-      `Scalp: Cooldown ${CONFIG.COOLDOWN_MIN}min · Bias-Filter ${CONFIG.REQUIRE_BIAS_ALIGN ? 'an' : 'aus'} · Lot ${LOT_SIZE}`,
+      `Scalp: ${CONFIG.REQUIRE_EMA_CROSS ? 'EMA-Cross (streng)' : 'EMA-Zustand (gelockert)'} · Cooldown ${CONFIG.COOLDOWN_MIN || 'aus'} · Bias-Filter ${CONFIG.REQUIRE_BIAS_ALIGN ? 'an' : 'aus'} · Lot ${LOT_SIZE}`,
       `Token gesetzt: ${TOKEN ? 'ja' : 'NEIN ⚠️'}`,
       '',
       '👉 Schickes Dashboard: /dashboard',
