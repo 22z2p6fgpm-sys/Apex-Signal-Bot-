@@ -109,7 +109,8 @@ async function openTrade({ sessionKey, signal, entry, sl, tp, type, tag }) {
     const brokerSL = round(signal === 'BUY' ? p - slDist : p + slDist, d);
     const brokerTP = round(signal === 'BUY' ? p + tpDist : p - tpDist, d);
 
-    const opts = { comment: 'ApexBot', clientId: (tag || sessionKey).slice(0, 24) + '_' + Date.now() };
+    // Minimale Optionen — je weniger Felder, desto weniger Validierungs-Fallstricke
+    const opts = { comment: 'ApexBot' };
     const res = signal === 'BUY'
       ? await connection.createMarketBuyOrder(symbol, volume, brokerSL, brokerTP, opts)
       : await connection.createMarketSellOrder(symbol, volume, brokerSL, brokerTP, opts);
@@ -122,7 +123,13 @@ async function openTrade({ sessionKey, signal, entry, sl, tp, type, tag }) {
     console.error(`❌ Broker-Order abgelehnt: ${res && (res.stringCode || res.description || res.message)} — ${label}`);
     return null;
   } catch (e) {
-    console.error(`❌ Broker openTrade Fehler (${label}):`, e.message);
+    // MetaApi-ValidationError enthält ein details-Array mit dem konkreten Feld — das brauchen wir!
+    let extra = '';
+    try {
+      if (e.details) extra = ' · DETAILS: ' + JSON.stringify(e.details);
+      else if (e.metadata) extra = ' · META: ' + JSON.stringify(e.metadata);
+    } catch (_) {}
+    console.error(`❌ Broker openTrade Fehler (${label}): ${e.message}${extra}`);
     return null;
   }
 }
