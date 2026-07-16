@@ -51,10 +51,10 @@ const CONFIG = {
   EVENING_RSI_SELL: [38, 48],
 
   // ── Swing (1H) ──
-  SWING_SL_MULT: 2,
-  SWING_TP1_MULT: 2.0,
-  SWING_TP2_MULT: 4.0,
-  SWING_TP3_MULT: 6.0,
+  SWING_SL_MULT: 1.2,
+  SWING_TP1_MULT: 1.0,
+  SWING_TP2_MULT: 2.0,
+  SWING_TP3_MULT: 3.0,
   SWING_TIMEOUT_MIN: 1440,
   SWING_EMA_FAST: 50,
   SWING_EMA_SLOW: 100,   // von 200 → 100: schnellerer Warmup (~1 Woche Marktzeit)
