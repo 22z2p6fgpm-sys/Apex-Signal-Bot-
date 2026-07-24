@@ -111,8 +111,14 @@ async function openTrade({ sessionKey, signal, entry, sl, tp, type, tag }) {
   const tpDist = Math.abs(tp - entry);   // Abstand Entry→TP3
 
   if (!EXECUTE) {
-    console.log(`🧪 [DRY-RUN] würde öffnen: ${signal} ${symbol} (${type} · SL-Abstand ${slDist.toFixed(2)})`);
-    return { positionId: `DRY-${Date.now()}`, brokerEntry: entry };
+    // Auch im Dry-Run die geplante Lot berechnen, damit die Anzeige stimmt
+    let dryVol = LOT_MAP[sessionKey];
+    if (type === 'swing' && RISK_SWING_EUR > 0 && EUR_PER_PRICE[sessionKey] > 0 && slDist > 0) {
+      dryVol = Math.max(0.01, Math.floor((RISK_SWING_EUR / (slDist * EUR_PER_PRICE[sessionKey])) / 0.01) * 0.01);
+      dryVol = parseFloat(dryVol.toFixed(2));
+    }
+    console.log(`🧪 [DRY-RUN] würde öffnen: ${signal} ${symbol} (${type} · ${dryVol} Lot · SL-Abstand ${slDist.toFixed(2)})`);
+    return { positionId: `DRY-${Date.now()}`, brokerEntry: entry, volume: dryVol };
   }
   if (!ready)   { console.warn(`⚠️ Broker nicht bereit — ${signal} ${symbol} NICHT ausgeführt`); return null; }
   if (openCount >= MAX_OPEN) { console.warn(`⚠️ MAX_OPEN_BROKER (${MAX_OPEN}) erreicht — ${signal} ${symbol} übersprungen`); return null; }
@@ -151,7 +157,7 @@ async function openTrade({ sessionKey, signal, entry, sl, tp, type, tag }) {
     if (ok(res) && res.positionId) {
       openCount++;
       console.log(`📈 Broker OPEN: ${label} @Vantage ${p} → SL ${brokerSL} TP ${brokerTP} · Pos ${res.positionId}`);
-      return { positionId: res.positionId, brokerEntry: p };
+      return { positionId: res.positionId, brokerEntry: p, volume };
     }
     console.error(`❌ Broker-Order abgelehnt: ${res && (res.stringCode || res.description || res.message)} — ${label}`);
     return null;
