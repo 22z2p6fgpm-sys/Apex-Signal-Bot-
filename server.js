@@ -25,7 +25,7 @@ const CONFIG = {
   TRAIL_AFTER_TP2: true,     // ab TP2 den SL mit dem Kurs mitziehen (Ratsche)
   TRAIL_ATR_MULT: 1.5,       // Trailing-Abstand = 1.5 × ATR hinter dem Kurs
 
-  MAX_CANDLES: 300,
+  MAX_CANDLES: 6500,   // hoch genug für 4H-Trend (26×240) & 1H-Liquidität — sonst nie A/B-Grades
   TRADE_TIMEOUT_MIN: 240, // 4h
   RSI_BUY: [45, 65],
   RSI_SELL: [35, 55],
@@ -69,11 +69,11 @@ const SYMBOL_FILTERS = {
     rsiSell: [38, 50],
     cooldownMin: 0,
     requireBiasAlign: true,
-    require15mAlign: true,
-    require4hAlign: true,
+    require15mAlign: false,
+    require4hAlign: false,
     require5mAlign: true,
     requireBOS: false,
-    requireLiquidity: true,
+    requireLiquidity: false,
     sweepBoost: true,
   },
   'XAUUSD': {
@@ -83,10 +83,10 @@ const SYMBOL_FILTERS = {
     cooldownMin: CONFIG.COOLDOWN_MIN,
     requireBiasAlign: CONFIG.REQUIRE_BIAS_ALIGN,
     require15mAlign: false,
-    require4hAlign: true,
+    require4hAlign: false,
     require5mAlign: true,
     requireBOS: false,
-    requireLiquidity: true,
+    requireLiquidity: false,
     sweepBoost: true,
   },
 };
@@ -554,6 +554,41 @@ function logSignal(entry) {
 }
 const lastTradeTime = {};
 
+// ── Dauerhafte Trade-Historie (persistiert) — Basis für die Weekly Summary ──
+const tradeHistory = [];
+const weeklyReport = { lastSent: null };  // Datum des letzten Freitag-Reports
+
+// Wochentag (0=So … 5=Fr, 6=Sa) in Berlin-Zeit
+function berlinWeekday() {
+  const s = new Date().toLocaleString('en-US', { timeZone: 'Europe/Berlin', weekday: 'short' });
+  return ({ Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 })[s.slice(0,3)] ?? 0;
+}
+
+// Einen abgeschlossenen Trade dauerhaft in die Historie schreiben
+function logHistory(trade, exitPrice, reason) {
+  const sessionKey = getSessionKey(trade.symbol);
+  const dir = trade.signal === 'BUY' ? 1 : -1;
+  const priceDiff = (exitPrice - trade.entry) * dir;
+  const { pips, money } = toPipsAndMoney(sessionKey, priceDiff, trade.lot);
+  tradeHistory.push({
+    ts: Date.now(),
+    date: getBerlinDate(),
+    weekday: berlinWeekday(),
+    symbol: getAssetLabel(trade.symbol),
+    signal: trade.signal,
+    type: trade.type,                 // '4confirm' | 'swing' | 'opening_range'
+    grade: trade.grade || null,       // nur Scalp hat ein Grade
+    entry: trade.entry,
+    exit: parseFloat(Number(exitPrice).toFixed(2)),
+    reason,                           // 'TP3' | 'Trailing' | 'BE' | 'SL' | 'Timeout'
+    result: money > 1 ? 'WIN' : (money < -1 ? 'LOSS' : 'BE'),
+    pnl: parseFloat(money.toFixed(1)),
+    pips: parseFloat(pips.toFixed(1)),
+    lot: trade.lot || null,
+  });
+  if (tradeHistory.length > 3000) tradeHistory.shift();
+}
+
 function hasOpenTrade(symbol) {
   return openTrades.some(t => t.symbol === symbol);
 }
@@ -639,6 +674,7 @@ Letztes Ziel ${trade.tp3.toFixed(2)}`);
       await sendTelegram(`🏆 *TP3 · ${assetLabel}* · ${fmtPnl(sessionKey, Math.abs(trade.tp3 - trade.entry), trade.lot)}
 ${trade.signal} ${tl} — voll durchgelaufen, Trade zu`);
       console.log(`🏆 TP3 HIT: ${trade.signal} ${assetLabel} — geschlossen`);
+      logHistory(trade, trade.tp3, 'TP3');
       await broker.closeTrade(trade.positionId);
       continue;
     }
@@ -654,6 +690,7 @@ ${trade.signal} ${tl} — voll durchgelaufen, Trade zu`);
 ${trade.signal} ${tl} — zu bei ${trade.sl.toFixed(2)}
 ${atBE ? `Kein Verlust · Gewinn aus TP1${trade.tp2Hit ? '/TP2' : ''} gesichert` : 'Gewinn über Entry gesichert'}`);
         console.log(`🛡 ${atBE ? 'BE' : 'Trailing'} Stop: ${trade.signal} ${assetLabel}`);
+        logHistory(trade, trade.sl, atBE ? 'BE' : 'Trailing');
       } else {
         const pnl = -Math.abs(trade.entry - trade.sl);
         if (sd && !trade.tp1Hit) recordTrade(sd, trade, 'LOSS', pnl);
@@ -663,6 +700,7 @@ ${atBE ? `Kein Verlust · Gewinn aus TP1${trade.tp2Hit ? '/TP2' : ''} gesichert`
 ${trade.signal} ${tl} — ${trade.entry.toFixed(2)} → ${trade.sl.toFixed(2)}
 _Heute ${sd ? sd.performance.wins : 0}W/${sd ? sd.performance.losses : 0}L · ${winRate}% · Serie ${sd ? sd.performance.streak : 0}×_`);
         console.log(`❌ LOSS: ${trade.signal} ${assetLabel}`);
+        logHistory(trade, trade.sl, 'SL');
       }
       await broker.closeTrade(trade.positionId);
       continue;
@@ -674,6 +712,7 @@ _Heute ${sd ? sd.performance.wins : 0}W/${sd ? sd.performance.losses : 0}L · ${
         await sendTelegram(`⌛ *Timeout · ${assetLabel}*
 ${trade.signal} ${tl} — nach Zeitlimit zu (Entry war ${trade.entry.toFixed(2)})`);
         console.log(`⏱ TIMEOUT: ${trade.signal} ${assetLabel}`);
+        logHistory(trade, trade.entry, 'Timeout');
       }
       await broker.closeTrade(trade.positionId);
       continue;
@@ -822,6 +861,53 @@ RSI ${Math.round(parseFloat(rsi))} · R:R 1:${rr} · Halten: Std–1 Tag
 _${getBerlinTime().slice(0,5)} · Apex_`;
 }
 
+// ── Wochen-Auswertung (Freitag 22:00) — maximal detailliert ──
+function statLine(label, arr) {
+  if (!arr.length) return null;
+  const w = arr.filter(t => t.result === 'WIN').length;
+  const l = arr.filter(t => t.result === 'LOSS').length;
+  const be = arr.filter(t => t.result === 'BE').length;
+  const pnl = arr.reduce((a, t) => a + t.pnl, 0);
+  const wr = (w + l) > 0 ? Math.round(w / (w + l) * 100) : 0;
+  const beStr = be ? `/${be}BE` : '';
+  return `${label.padEnd(9)} ${String(arr.length).padStart(3)}T  ${String(wr).padStart(3)}%  ${(pnl >= 0 ? '+' : '') + Math.round(pnl)}€  (${w}W/${l}L${beStr})`;
+}
+
+function buildWeeklyReport() {
+  const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const wk = tradeHistory.filter(t => t.ts >= since);
+  if (!wk.length) {
+    return `📅 *WOCHEN-REPORT*\n_${getBerlinDate()}_\n\nKeine abgeschlossenen Trades in dieser Woche.\n_Apex_`;
+  }
+  const totalPnl = wk.reduce((a, t) => a + t.pnl, 0);
+  const w = wk.filter(t => t.result === 'WIN').length;
+  const l = wk.filter(t => t.result === 'LOSS').length;
+  const wr = (w + l) > 0 ? Math.round(w / (w + l) * 100) : 0;
+
+  const bySymbol = ['XAU/USD', 'NASDAQ 100'].map(sym => statLine(sym === 'XAU/USD' ? 'Gold' : 'NASDAQ', wk.filter(t => t.symbol === sym))).filter(Boolean);
+  const byType = [['4confirm','Scalp'], ['swing','Swing'], ['opening_range','Range']].map(([k, lbl]) => statLine(lbl, wk.filter(t => t.type === k))).filter(Boolean);
+  const byGrade = ['A+','A','B','C'].map(g => statLine('Grade '+g, wk.filter(t => t.grade === g))).filter(Boolean);
+  const byReason = ['TP3','Trailing','BE','SL','Timeout'].map(r => statLine(r, wk.filter(t => t.reason === r))).filter(Boolean);
+  const byDay = ['Mo','Di','Mi','Do','Fr'].map((lbl, i) => statLine(lbl, wk.filter(t => t.weekday === i + 1))).filter(Boolean);
+
+  const best = wk.reduce((a, t) => t.pnl > a.pnl ? t : a, wk[0]);
+  const worst = wk.reduce((a, t) => t.pnl < a.pnl ? t : a, wk[0]);
+
+  const sec = (title, lines) => lines.length ? `\n*${title}*\n${block(lines)}` : '';
+
+  return `📅 *WOCHEN-REPORT*
+_${getBerlinDate()}_
+
+${block([
+  `Trades    ${wk.length}`,
+  `Win-Rate  ${wr}%  (${w}W/${l}L)`,
+  `PnL       ${(totalPnl >= 0 ? '+' : '') + Math.round(totalPnl)} €`,
+])}${sec('Nach Symbol', bySymbol)}${sec('Nach Typ', byType)}${sec('Nach Grade', byGrade)}${sec('Nach Ausgang', byReason)}${sec('Nach Wochentag', byDay)}
+🏆 Bester:  ${best.signal} ${best.symbol} +${Math.round(best.pnl)}€ (${best.reason})
+💀 Schlimmster: ${worst.signal} ${worst.symbol} ${Math.round(worst.pnl)}€ (${worst.reason})
+_Apex · Wochenschluss_`;
+}
+
 function buildPerformanceReport(asset, perf, sessionKey) {
   const total = perf.wins + perf.losses;
   const winRate = total > 0 ? ((perf.wins / total) * 100).toFixed(1) : '0';
@@ -940,7 +1026,7 @@ const STATE_FILE = path.join(DATA_DIR, 'apex-state.json');
 function saveState() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const state = { v: 1, savedAt: Date.now(), swingStore, swingBuilder, openTrades, lastTradeTime };
+    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent };
     fs.writeFileSync(STATE_FILE, JSON.stringify(state));
   } catch (e) {
     console.warn('⚠️ State speichern fehlgeschlagen (Volume auf /data gemountet?):', e.message);
@@ -955,6 +1041,11 @@ function loadState() {
     }
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     for (const k of ['XAUUSD', 'NDX']) {
+      if (s.store && s.store[k]) {
+        store[k].closes = s.store[k].closes || [];
+        store[k].highs  = s.store[k].highs  || [];
+        store[k].lows   = s.store[k].lows   || [];
+      }
       if (s.swingStore && s.swingStore[k]) {
         swingStore[k].closes = s.swingStore[k].closes || [];
         swingStore[k].highs  = s.swingStore[k].highs  || [];
@@ -965,8 +1056,10 @@ function loadState() {
     }
     if (Array.isArray(s.openTrades)) { openTrades.length = 0; openTrades.push(...s.openTrades); }
     if (s.lastTradeTime) Object.assign(lastTradeTime, s.lastTradeTime);
+    if (Array.isArray(s.tradeHistory)) { tradeHistory.length = 0; tradeHistory.push(...s.tradeHistory); }
+    if (s.weeklyLastSent) weeklyReport.lastSent = s.weeklyLastSent;
     const age = s.savedAt ? Math.round((Date.now() - s.savedAt) / 1000) : '?';
-    console.log(`✅ State geladen: ${swingStore['XAUUSD'].closes.length} XAU / ${swingStore['NDX'].closes.length} NDX Swing-Kerzen · ${openTrades.length} offene Trades (vor ${age}s gesichert)`);
+    console.log(`✅ State geladen: ${store['XAUUSD'].closes.length}/${store['NDX'].closes.length} Scalp-Kerzen · ${swingStore['XAUUSD'].closes.length}/${swingStore['NDX'].closes.length} Swing-Kerzen · ${openTrades.length} offene Trades · ${tradeHistory.length} Trades in Historie (vor ${age}s gesichert)`);
   } catch (e) {
     console.warn('⚠️ State laden fehlgeschlagen:', e.message);
   }
@@ -1500,6 +1593,13 @@ const server = http.createServer((req, res) => {
             sd.reportSent = true;
             await sendTelegram(buildPerformanceReport(assetLabel, sd.performance, sessionKey));
             console.log(`📊 Report ${assetLabel}`);
+          }
+
+          // 4b. Wochen-Report (Freitag ab 22:00) — nur einmal pro Woche, global
+          if (berlinWeekday() === 5 && t >= T.REPORT && weeklyReport.lastSent !== getBerlinDate()) {
+            weeklyReport.lastSent = getBerlinDate();
+            await sendTelegram(buildWeeklyReport());
+            console.log('📅 Wochen-Report gesendet');
           }
         }
 
