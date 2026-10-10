@@ -26,6 +26,9 @@ const CONFIG = {
   TRAIL_ATR_MULT: 1.5,       // Trailing-Abstand = 1.5 × ATR hinter dem Kurs
 
   MAX_CANDLES: 6500,   // hoch genug für 4H-Trend (26×240) & 1H-Liquidität — sonst nie A/B-Grades
+  // Opening-Range-Breakout (15:45) — standardmäßig AUS (~20% Trefferquote, verlässlich rot).
+  // Zum Wieder-Anschalten: Railway-Env ENABLE_OPENING_RANGE=true setzen.
+  ENABLE_OPENING_RANGE: process.env.ENABLE_OPENING_RANGE === 'true',
   TRADE_TIMEOUT_MIN: 240, // 4h
   RSI_BUY: [45, 65],
   RSI_SELL: [35, 55],
@@ -362,7 +365,12 @@ function runStrategy(closes, highs, lows, sessionKey) {
     ? (signal === 'BUY' ? liqInfo.liqAbove : liqInfo.liqBelow)
     : null;
 
-  const t4hGrade = getTrendOnTF(closes, highs, lows, 240);
+  // 4H-Trend aus den 1H-Swing-Kerzen (×4) statt aus 6.240 Minuten-Kerzen —
+  // sonst feuert dieser Faktor fast nie und A/A+ bleiben unerreichbar.
+  const sw4h = swingStore[sessionKey];
+  const t4hGrade = (sw4h && sw4h.closes.length >= 104)
+    ? getTrendOnTF(sw4h.closes, sw4h.highs, sw4h.lows, 4)   // 4× 1H = 4H, braucht nur 26 Kerzen
+    : getTrendOnTF(closes, highs, lows, 240);               // Fallback bis Swing-Store warm ist
   const t15Grade = get15MTrend(closes, highs, lows);
   const fvg = detectFVG(closes, highs, lows, signal);
   const lastBodyRatio = bodyStrength(closes, highs, lows);
@@ -1023,10 +1031,24 @@ function normalizeSymbol(symbol) {
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const STATE_FILE = path.join(DATA_DIR, 'apex-state.json');
 
+// ─── TRADING-PAUSE (über das Dashboard steuerbar) ─────────────────────────────
+// pauseUntil = ms-Zeitstempel, bis zu dem KEINE Orders platziert werden.
+// Signale, Kerzen, Grades und die Statistik laufen trotzdem weiter (Daten sammeln!).
+// null = aktiv. Ist die Zeit abgelaufen, schaltet sich der Bot selbst wieder scharf.
+let pauseUntil = null;
+function tradingPaused() {
+  if (pauseUntil != null && Date.now() >= pauseUntil) {
+    pauseUntil = null;
+    console.log('▶️ Trading-Pause abgelaufen — Orders wieder aktiv');
+    saveState();
+  }
+  return pauseUntil != null;
+}
+
 function saveState() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent };
+    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent, pauseUntil };
     fs.writeFileSync(STATE_FILE, JSON.stringify(state));
   } catch (e) {
     console.warn('⚠️ State speichern fehlgeschlagen (Volume auf /data gemountet?):', e.message);
@@ -1058,6 +1080,7 @@ function loadState() {
     if (s.lastTradeTime) Object.assign(lastTradeTime, s.lastTradeTime);
     if (Array.isArray(s.tradeHistory)) { tradeHistory.length = 0; tradeHistory.push(...s.tradeHistory); }
     if (s.weeklyLastSent) weeklyReport.lastSent = s.weeklyLastSent;
+    if (typeof s.pauseUntil === 'number') pauseUntil = s.pauseUntil;
     const age = s.savedAt ? Math.round((Date.now() - s.savedAt) / 1000) : '?';
     console.log(`✅ State geladen: ${store['XAUUSD'].closes.length}/${store['NDX'].closes.length} Scalp-Kerzen · ${swingStore['XAUUSD'].closes.length}/${swingStore['NDX'].closes.length} Swing-Kerzen · ${openTrades.length} offene Trades · ${tradeHistory.length} Trades in Historie (vor ${age}s gesichert)`);
   } catch (e) {
@@ -1124,6 +1147,16 @@ td{padding:11px 13px;border-top:1px solid var(--border);font-size:13px}
 .muted{color:var(--muted)}.empty{text-align:center;padding:26px;color:var(--muted)}
 .foot{text-align:center;margin-top:20px;font-size:10px;color:var(--muted);opacity:.6}
 .hidden{display:none}
+.ctrl{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:15px 17px;margin-bottom:18px}
+.ctrlstatus{font-size:13px;font-weight:800;margin-bottom:12px;line-height:1.5}
+.ctrlstatus.on{color:var(--green)}
+.ctrlstatus.off{color:var(--gold)}
+.ctrlbtns{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+.ctrlbtn{padding:10px 14px;border-radius:9px;border:1px solid var(--border);font-weight:700;font-size:13px;cursor:pointer;color:var(--text);background:var(--panel2)}
+.ctrlbtn.pz{border-color:rgba(255,208,96,.45);color:var(--gold)}
+.ctrlbtn.go{border-color:rgba(52,245,197,.45);color:var(--green)}
+.ctrlbtn:active{filter:brightness(1.3)}
+.ctrlmin{width:76px;padding:10px;border-radius:9px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:13px}
 .stratcard{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:12px}
 .stratrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);font-size:13px}
 .stratrow:last-child{border-bottom:none}
@@ -1166,6 +1199,15 @@ td{padding:11px 13px;border-top:1px solid var(--border);font-size:13px}
 
     <!-- SEITE: Dashboard -->
     <div class="page" id="page-dashboard">
+      <div class="ctrl">
+        <div class="ctrlstatus" id="ctrlStatus">●</div>
+        <div class="ctrlbtns">
+          <button class="ctrlbtn pz" onclick="ctrl('pause-midnight')">⏸ Bis Mitternacht</button>
+          <input class="ctrlmin" id="ctrlMin" type="number" min="1" max="1440" placeholder="Min" inputmode="numeric">
+          <button class="ctrlbtn pz" onclick="ctrl('pause',document.getElementById('ctrlMin').value)">⏸ X Min pausieren</button>
+          <button class="ctrlbtn go" onclick="ctrl('resume')">▶️ Jetzt aktivieren</button>
+        </div>
+      </div>
       <div class="row" id="stats"></div>
       <div class="equity">
         <div class="equityhead"><div class="equitytitle">📈 Equity-Kurve <span class="muted" id="eqlabel"></span></div></div>
@@ -1322,11 +1364,30 @@ function drawEquity(eq){
     '<path d="'+area+'" fill="url(#eg)"/>'+
     '<path d="'+line+'" fill="none" stroke="'+col+'" stroke-width="2"/>';
 }
+function fmtResume(ts){
+  if(!ts)return '';
+  try{return new Date(ts).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit',timeZone:'Europe/Berlin'});}catch(e){return '';}
+}
+function renderControl(){
+  const el=document.getElementById('ctrlStatus');if(!el||!data)return;
+  if(data.paused){
+    el.className='ctrlstatus off';
+    el.innerHTML='⏸ TRADING PAUSIERT — wieder aktiv ab '+fmtResume(data.pauseUntil)+' Uhr<br><span class="muted">Signale, Grades &amp; Statistik laufen weiter — es werden nur keine Orders platziert</span>';
+  } else {
+    el.className='ctrlstatus on';
+    el.innerHTML='● TRADING AKTIV — Orders werden automatisch platziert';
+  }
+}
+async function ctrl(action,min){
+  let url='/control?action='+action;
+  if(action==='pause'){const m=parseInt(min||'0',10);if(!m||m<1){alert('Bitte eine Minutenzahl eingeben');return;}url+='&min='+m;}
+  try{await fetch(url);await refresh();}catch(e){alert('Fehler: '+e.message);}
+}
 async function refresh(){
   try{const r=await fetch('/data');data=await r.json();
     document.getElementById('engtime').textContent='· '+data.time;
-    document.getElementById('sidestatus').textContent='● ENGINE ONLINE';
-    render();
+    document.getElementById('sidestatus').textContent=data.paused?'⏸ PAUSIERT':'● ENGINE ONLINE';
+    render();renderControl();
   }catch(e){document.getElementById('sidestatus').textContent='● OFFLINE';}
 }
 refresh();setInterval(refresh,5000);
@@ -1411,6 +1472,7 @@ const server = http.createServer((req, res) => {
     const combinedPips = (parseFloat(gold.totalPips) + parseFloat(ndx.totalPips)).toFixed(1);
     const payload = {
       time: getBerlinTime(), date: getBerlinDate(),
+      paused: tradingPaused(), pauseUntil,
       openTrades: openTrades.map(t => ({ symbol: getAssetLabel(t.symbol), signal: t.signal, type: t.type, entry: t.entry, grade: t.grade || null, tp1Hit: !!t.tp1Hit, tp2Hit: !!t.tp2Hit })),
       signals: signalLog.slice(0, 20),
       strategy: {
@@ -1430,6 +1492,32 @@ const server = http.createServer((req, res) => {
     const body = JSON.stringify(payload);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(body);
+  }
+
+  // Trading-Steuerung (Pause/Resume) — wird vom Dashboard aufgerufen
+  if (req.method === 'GET' && req.url.startsWith('/control')) {
+    const u = new URL(req.url, 'http://localhost');
+    const action = u.searchParams.get('action');
+    let msg = '';
+    if (action === 'pause-midnight') {
+      const minsLeft = (24 * 60) - berlinMinutesOfDay();
+      pauseUntil = Date.now() + Math.max(1, minsLeft) * 60 * 1000;
+      msg = 'Pausiert bis Mitternacht (Berlin)';
+    } else if (action === 'pause') {
+      const min = Math.max(1, Math.min(1440, parseInt(u.searchParams.get('min') || '0', 10)));
+      pauseUntil = Date.now() + min * 60 * 1000;
+      msg = `Pausiert für ${min} Min`;
+    } else if (action === 'resume') {
+      pauseUntil = null;
+      msg = 'Wieder aktiv — Orders werden platziert';
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, error: 'Unbekannte action' }));
+    }
+    saveState();
+    console.log(`⏯ Trading-Steuerung: ${msg}`);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify({ ok: true, msg, paused: pauseUntil != null, pauseUntil }));
   }
 
   // Dashboard HTML
@@ -1507,7 +1595,9 @@ const server = http.createServer((req, res) => {
                     type: 'swing', timeoutMin: CONFIG.SWING_TIMEOUT_MIN, openedAt: Date.now(),
                   };
                   openTrades.push(swTrade);
-                  const swEx = await broker.openTrade({ sessionKey, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp3, type: 'swing', tag: swingKey });
+                  const swEx = tradingPaused()
+                    ? { positionId: 'DRY-' + Date.now(), brokerEntry: sw.cur }   // Pause: virtuell tracken, keine echte Order
+                    : await broker.openTrade({ sessionKey, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp3, type: 'swing', tag: swingKey });
                   if (swEx) { swTrade.positionId = swEx.positionId; swTrade.brokerEntry = swEx.brokerEntry; swTrade.lot = swEx.volume; }
                   await sendTelegram(buildSwingSignalMsg(
                     sw.signal, assetLabel, sw.cur, sw.sl, sw.tp1, sw.tp2, sw.tp3, sw.rr, sw.rsi, sw.trend, swTrade.lot
@@ -1558,14 +1648,14 @@ const server = http.createServer((req, res) => {
           }
 
           // 2. Opening Range (15:45) — nur einmal
-          if (t >= T.RANGE_END && !sd.openingRange.sent && sd.openingRange.high !== null) {
+          if (CONFIG.ENABLE_OPENING_RANGE && t >= T.RANGE_END && !sd.openingRange.sent && sd.openingRange.high !== null) {
             sd.openingRange.sent = true;
             await sendTelegram(buildOpeningRangeMsg(assetLabel, sd.openingRange.high, sd.openingRange.low));
             console.log(`🟣 Opening Range ${assetLabel}`);
           }
 
           // 3. Opening Range Breakout — nur einmal, nur wenn kein offener Trade
-          if (sd.openingRange.sent && !sd.openingRange.breakoutSent && !hasOpenTrade(normSym)) {
+          if (CONFIG.ENABLE_OPENING_RANGE && sd.openingRange.sent && !sd.openingRange.breakoutSent && !hasOpenTrade(normSym)) {
             const bo = checkOpeningRangeBreakout(sd, close);
             if (bo) {
               sd.openingRange.breakoutSent = true;
@@ -1579,7 +1669,9 @@ const server = http.createServer((req, res) => {
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               const orTrade = { symbol: normSym, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp1, tp2, tp3, rr, atr: atrV, type: 'opening_range', openedAt: Date.now() };
               openTrades.push(orTrade);
-              const orEx = await broker.openTrade({ sessionKey, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp: tp3, type: 'opening_range', tag: normSym });
+              const orEx = tradingPaused()
+                ? { positionId: 'DRY-' + Date.now(), brokerEntry: parseFloat(close.toFixed(2)) }   // Pause: nur tracken
+                : await broker.openTrade({ sessionKey, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp: tp3, type: 'opening_range', tag: normSym });
               if (orEx) { orTrade.positionId = orEx.positionId; orTrade.brokerEntry = orEx.brokerEntry; orTrade.lot = orEx.volume; }
               await sendTelegram(buildOpeningRangeSignalMsg(bo, assetLabel, close, sl, tp1, tp2, tp3, rr, sd.lastBias, trend15m, orTrade.lot));
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: bo, type: 'Opening Range', grade: null, entry: parseFloat(close.toFixed(2)) });
@@ -1618,7 +1710,9 @@ const server = http.createServer((req, res) => {
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
               const scTrade = { symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, atr: result.atr, type: '4confirm', grade: result.grade, openedAt: Date.now() };
               openTrades.push(scTrade);
-              const scEx = await broker.openTrade({ sessionKey, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp3, type: 'scalp', tag: normSym });
+              const scEx = tradingPaused()
+                ? { positionId: 'DRY-' + Date.now(), brokerEntry: result.cur }   // Pause: nur tracken
+                : await broker.openTrade({ sessionKey, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp3, type: 'scalp', tag: normSym });
               if (scEx) { scTrade.positionId = scEx.positionId; scTrade.brokerEntry = scEx.brokerEntry; scTrade.lot = scEx.volume; }
               await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp1, result.tp2, result.tp3, result.rr, result.rsi, result.macd, bias, trend15m, result.liqTarget, result.sweptLiquidity, result.grade, result.score, result.factors, scTrade.lot));
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: result.signal, type: 'Scalp', grade: result.grade, entry: result.cur });
@@ -1657,6 +1751,7 @@ server.listen(PORT, () => {
 
 // State periodisch sichern (alle 30s) + sauber beim Herunterfahren (Railway-Redeploy)
 setInterval(saveState, 30000);
+setInterval(tradingPaused, 60000); // abgelaufene Trading-Pause selbsttätig beenden
 function gracefulExit() { try { saveState(); } catch (_) {} process.exit(0); }
 process.on('SIGTERM', gracefulExit);
 process.on('SIGINT', gracefulExit);
