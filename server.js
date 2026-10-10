@@ -600,6 +600,39 @@ function logHistory(trade, exitPrice, reason) {
   if (tradeHistory.length > 3000) tradeHistory.shift();
 }
 
+// Bucht einen abgeschlossenen Trade EINMAL — beim echten Positions-Schluss — für
+// Dashboard-Statistik UND persistente Historie aus derselben Quelle. So zeigen beide
+// denselben, vollen Gewinn (TP3/Trailing), statt nur den TP1-Teilbetrag.
+function recordClose(trade, exitPrice, reason) {
+  const sessionKey = getSessionKey(trade.symbol);
+  const sd = sessionKey ? sessionData[sessionKey] : null;
+  const dir = trade.signal === 'BUY' ? 1 : -1;
+  const priceDiff = (exitPrice - trade.entry) * dir;              // Preis-Differenz (Dashboard-Konvention)
+  const { pips, money } = toPipsAndMoney(sessionKey, priceDiff, trade.lot);
+  const result = money > 1 ? 'WIN' : (money < -1 ? 'LOSS' : 'BE');
+  // Dashboard-Performance (nur WIN/LOSS zählen für Serie; BE ist neutral)
+  if (sd) {
+    if (result === 'WIN') {
+      sd.performance.wins++;
+      if (sd.performance.streakType === 'WIN') sd.performance.streak++; else { sd.performance.streak = 1; sd.performance.streakType = 'WIN'; }
+      if (sd.performance.streak > sd.performance.bestStreak) sd.performance.bestStreak = sd.performance.streak;
+    } else if (result === 'LOSS') {
+      sd.performance.losses++;
+      if (sd.performance.streakType === 'LOSS') sd.performance.streak++; else { sd.performance.streak = 1; sd.performance.streakType = 'LOSS'; }
+      if (sd.performance.streak > sd.performance.worstStreak) sd.performance.worstStreak = sd.performance.streak;
+    }
+    sd.performance.trades.push({ signal: trade.signal, entry: trade.entry, result, pnl: parseFloat(priceDiff.toFixed(4)), lot: trade.lot, time: getBerlinTime() });
+  }
+  // Persistente Historie (Wochenreport) — identischer Exit
+  tradeHistory.push({
+    ts: Date.now(), date: getBerlinDate(), weekday: berlinWeekday(),
+    symbol: getAssetLabel(trade.symbol), signal: trade.signal, type: trade.type,
+    grade: trade.grade || null, entry: trade.entry, exit: parseFloat(Number(exitPrice).toFixed(2)),
+    reason, result, pnl: parseFloat(money.toFixed(1)), pips: parseFloat(pips.toFixed(1)), lot: trade.lot || null,
+  });
+  if (tradeHistory.length > 3000) tradeHistory.shift();
+}
+
 function hasOpenTrade(symbol) {
   return openTrades.some(t => t.symbol === symbol);
 }
@@ -634,14 +667,9 @@ async function checkOpenTrades(symbol, high, low) {
 
     if (!trade.tp1Hit && reached(trade.tp1)) {
       trade.tp1Hit = true;
-      const pnl = Math.abs(trade.tp1 - trade.entry);
-      if (sd) recordTrade(sd, trade, 'WIN', pnl);
-      const total = sd ? sd.performance.wins + sd.performance.losses : 0;
-      const winRate = total > 0 ? ((sd.performance.wins / total) * 100).toFixed(1) : '0';
-      await sendTelegram(`✅ *TP1 · ${assetLabel}* · ${fmtPnl(sessionKey, Math.abs(trade.tp1 - trade.entry), trade.lot)}
-${trade.signal} ${tl} — WIN gesichert
-Nächstes Ziel ${trade.tp2.toFixed(2)}
-_Heute ${sd ? sd.performance.wins : 0}W/${sd ? sd.performance.losses : 0}L · ${winRate}% · Serie ${sd ? sd.performance.streak : 0}×_`);
+      await sendTelegram(`✅ *TP1 erreicht · ${assetLabel}* · ${fmtPnl(sessionKey, Math.abs(trade.tp1 - trade.entry), trade.lot)}
+${trade.signal} ${tl} — SL wandert nach, Trade läuft weiter
+Nächstes Ziel ${trade.tp2.toFixed(2)}`);
       console.log(`🎯 TP1 HIT: ${trade.signal} ${assetLabel}`);
     }
 
@@ -685,7 +713,7 @@ Letztes Ziel ${trade.tp3.toFixed(2)}`);
       await sendTelegram(`🏆 *TP3 · ${assetLabel}* · ${fmtPnl(sessionKey, Math.abs(trade.tp3 - trade.entry), trade.lot)}
 ${trade.signal} ${tl} — voll durchgelaufen, Trade zu`);
       console.log(`🏆 TP3 HIT: ${trade.signal} ${assetLabel} — geschlossen`);
-      logHistory(trade, trade.tp3, 'TP3');
+      recordClose(trade, trade.tp3, 'TP3');
       await broker.closeTrade(trade.positionId);
       continue;
     }
@@ -701,17 +729,15 @@ ${trade.signal} ${tl} — voll durchgelaufen, Trade zu`);
 ${trade.signal} ${tl} — zu bei ${trade.sl.toFixed(2)}
 ${atBE ? `Kein Verlust · Gewinn aus TP1${trade.tp2Hit ? '/TP2' : ''} gesichert` : 'Gewinn über Entry gesichert'}`);
         console.log(`🛡 ${atBE ? 'BE' : 'Trailing'} Stop: ${trade.signal} ${assetLabel}`);
-        logHistory(trade, trade.sl, atBE ? 'BE' : 'Trailing');
+        recordClose(trade, trade.sl, atBE ? 'BE' : 'Trailing');
       } else {
-        const pnl = -Math.abs(trade.entry - trade.sl);
-        if (sd && !trade.tp1Hit) recordTrade(sd, trade, 'LOSS', pnl);
+        recordClose(trade, trade.sl, 'SL');
         const total = sd ? sd.performance.wins + sd.performance.losses : 0;
         const winRate = total > 0 ? ((sd.performance.wins / total) * 100).toFixed(1) : '0';
         await sendTelegram(`❌ *Loss · ${assetLabel}* · ${fmtPnl(sessionKey, -Math.abs(trade.entry - trade.sl), trade.lot)}
 ${trade.signal} ${tl} — ${trade.entry.toFixed(2)} → ${trade.sl.toFixed(2)}
 _Heute ${sd ? sd.performance.wins : 0}W/${sd ? sd.performance.losses : 0}L · ${winRate}% · Serie ${sd ? sd.performance.streak : 0}×_`);
         console.log(`❌ LOSS: ${trade.signal} ${assetLabel}`);
-        logHistory(trade, trade.sl, 'SL');
       }
       await broker.closeTrade(trade.positionId);
       continue;
@@ -723,8 +749,8 @@ _Heute ${sd ? sd.performance.wins : 0}W/${sd ? sd.performance.losses : 0}L · ${
         await sendTelegram(`⌛ *Timeout · ${assetLabel}*
 ${trade.signal} ${tl} — nach Zeitlimit zu (Entry war ${trade.entry.toFixed(2)})`);
         console.log(`⏱ TIMEOUT: ${trade.signal} ${assetLabel}`);
-        logHistory(trade, trade.entry, 'Timeout');
       }
+      recordClose(trade, trade.entry, 'Timeout');
       await broker.closeTrade(trade.positionId);
       continue;
     }
