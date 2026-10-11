@@ -1100,6 +1100,29 @@ let propConfig = {
   startTs: null,         // Beginn der laufenden Challenge-Auswertung
 };
 
+// ─── LOT-/RISIKO-SIZING (über das Dashboard steuerbar, voll umschaltbar) ──────
+// propRiskEnabled=false → Normal-Modus: Scalp/Range mit festem Lot (normLot*),
+//   Swing bleibt risiko-basiert wie bisher (broker.js SWING_RISK_EUR).
+// propRiskEnabled=true  → Prop-Risk-Modus: ALLE Trades mit ~propRiskEur Risiko
+//   pro Trade (broker.js rechnet die Lot aus dem SL-Abstand).
+let lotConfig = {
+  propRiskEnabled: false,
+  normLotXau: parseFloat(process.env.LOT_XAUUSD || '1'),
+  normLotNdx: Math.min(5, parseFloat(process.env.LOT_NDX || '2')),  // Slider deckelt bei 5
+  propRiskEur: 25,       // Risiko € pro Trade im Prop-Modus
+};
+const NORM_LOT_MAX = 5;          // Max für die Normal-Lot-Slider (Wunsch: max 5)
+const PROP_RISK_MAX = 100;       // Max für den Risiko-€-Slider
+const PROP_RISK_RECOMMENDED = 25; // Empfehlung ~6 Verlierer bis $150-Tagesstopp
+
+// Liefert die Sizing-Argumente für broker.openTrade je nach Modus + Trade-Typ.
+function sizingFor(sessionKey, type) {
+  if (lotConfig.propRiskEnabled) return { riskEur: lotConfig.propRiskEur };
+  // Normal-Modus: Scalp/Range fester Lot aus Slider; Swing bleibt Default (risiko-basiert)
+  if (type === 'swing') return {};
+  return { lotOverride: sessionKey === 'XAUUSD' ? lotConfig.normLotXau : lotConfig.normLotNdx };
+}
+
 // Rechnet den aktuellen Prop-Firm-Stand aus der persistenten Trade-Historie.
 // Alle Beträge sind die GETRACKTEN (geschätzten) EUR-Werte — fürs Demo-Tracking ok,
 // die echte Broker-Equity kommt in Phase 2 dazu.
@@ -1159,7 +1182,7 @@ function computeProp() {
 function saveState() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent, pauseUntil, sessionData, dailyFlags, propConfig };
+    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent, pauseUntil, sessionData, dailyFlags, propConfig, lotConfig };
     fs.writeFileSync(STATE_FILE, JSON.stringify(state));
   } catch (e) {
     console.warn('⚠️ State speichern fehlgeschlagen (Volume auf /data gemountet?):', e.message);
@@ -1193,6 +1216,7 @@ function loadState() {
     if (s.weeklyLastSent) weeklyReport.lastSent = s.weeklyLastSent;
     if (typeof s.pauseUntil === 'number') pauseUntil = s.pauseUntil;
     if (s.propConfig) Object.assign(propConfig, s.propConfig);
+    if (s.lotConfig) Object.assign(lotConfig, s.lotConfig);
     if (s.sessionData) for (const k of ['XAUUSD', 'NDX']) { if (s.sessionData[k]) Object.assign(sessionData[k], s.sessionData[k]); }
     if (s.dailyFlags) Object.assign(dailyFlags, s.dailyFlags);
     const age = s.savedAt ? Math.round((Date.now() - s.savedAt) / 1000) : '?';
@@ -1359,6 +1383,18 @@ svg.eq{width:100%;height:150px;display:block}
 .pbar{height:9px;border-radius:6px;background:rgba(7,7,16,.6);overflow:hidden}
 .pbar span{display:block;height:100%;border-radius:6px;transition:width .5s ease}
 .pf-ok{background:linear-gradient(90deg,#22E6A0,#39E3FF)} .pf-warn{background:linear-gradient(90deg,#F4B33D,#FF4E6A)} .pf-bad{background:linear-gradient(90deg,#FF4E6A,#FF4E6A)}
+/* Sizing */
+.sizingcard{border-radius:17px;padding:17px 18px;background:var(--glass);border:1px solid var(--line);margin-bottom:14px}
+.modetoggle{display:flex;gap:8px;margin-bottom:16px}
+.mbtn{flex:1;padding:11px 10px;border-radius:12px;border:1px solid var(--line2);background:rgba(7,7,16,.5);color:var(--dim);font-weight:600;font-size:13px;cursor:pointer;transition:.16s}
+.mbtn.on{color:var(--txt);background:linear-gradient(135deg,rgba(154,108,255,.3),rgba(57,227,255,.12));border-color:var(--line2);box-shadow:0 0 16px -4px var(--violet)}
+.slrow{margin-bottom:15px}
+.sllab{display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:8px}
+.sllab .slval{font-family:var(--mono);font-weight:800;color:var(--cyan)}
+.slhint{font-size:11.5px;color:var(--dim);line-height:1.5;margin-top:4px}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:7px;border-radius:5px;background:rgba(7,7,16,.7);outline:none;border:1px solid var(--line)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,var(--gold),var(--violet));cursor:pointer;box-shadow:0 0 12px rgba(154,108,255,.6);border:2px solid #0C0B1B}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,var(--gold),var(--violet));cursor:pointer;border:2px solid #0C0B1B}
 .foot{text-align:center;margin-top:26px;font-size:11px;color:var(--dim);opacity:.6;font-family:var(--mono)}
 
 @media(max-width:620px){
@@ -1448,7 +1484,26 @@ svg.eq{width:100%;height:150px;display:block}
         <button class="cbtn pz" onclick="propAct('reset')">↺ Challenge neu starten</button>
         <button class="cbtn" onclick="propAct('off')">Prop-Modus aus</button>
       </div>
-      <div class="propnote">Phase 1: reines Tracking auf Basis der getrackten (geschätzten) P&amp;L. Der harte Auto-Stop und die echte Broker-Equity kommen in Phase 2 — erst mit echtem Prop-MT5.</div>
+      <div class="sect">Lot &amp; Sizing</div>
+      <div class="sizingcard">
+        <div class="modetoggle">
+          <button class="mbtn" id="sm_norm" onclick="sizingMode(0)">Normal · fester Lot</button>
+          <button class="mbtn" id="sm_prop" onclick="sizingMode(1)">Prop-Risk · €/Trade</button>
+        </div>
+        <div id="sz_norm">
+          <div class="slrow"><div class="sllab"><span>Gold-Lot (XAU/USD)</span><span class="slval" id="v_lotXau">–</span></div>
+            <input type="range" id="s_lotXau" min="0.01" max="5" step="0.01" oninput="szLabel('lotXau')" onchange="saveSizing()"></div>
+          <div class="slrow"><div class="sllab"><span>NAS-Lot (NAS100)</span><span class="slval" id="v_lotNdx">–</span></div>
+            <input type="range" id="s_lotNdx" min="0.01" max="5" step="0.01" oninput="szLabel('lotNdx')" onchange="saveSizing()"></div>
+          <div class="slhint">Fester Lot pro Trade. Swing bleibt im Normal-Modus risiko-basiert wie bisher.</div>
+        </div>
+        <div id="sz_prop" class="hide">
+          <div class="slrow"><div class="sllab"><span>Risiko € pro Trade</span><span class="slval" id="v_riskEur">–</span></div>
+            <input type="range" id="s_riskEur" min="1" max="100" step="1" oninput="szLabel('riskEur')" onchange="saveSizing()"></div>
+          <div class="slhint" id="riskHint">Der Bot rechnet die Lot selbst, sodass jeder Trade ~gleich viel riskiert — egal wie weit der Stop.</div>
+        </div>
+      </div>
+      <div class="propnote">Sizing ist voll umschaltbar: <b>Normal</b> = fester Lot (wie bisher), <b>Prop-Risk</b> = Risiko €/Trade. — Hinweis: Das exakte margin-sichere Maximum (Hebel 1:30) liest der Bot in Phase 2 live vom echten Konto; der harte Auto-Stop kommt ebenfalls dort.</div>
     </div>
 
     <div class="foot">Aktualisiert alle 5s · Apex Signal Bot</div>
@@ -1524,7 +1579,7 @@ function render(){
   if(page==='signals')renderSignals();
   if(page==='history')renderHistory();
   if(page==='strategy')renderStrategy();
-  if(page==='prop')renderProp();
+  if(page==='prop'){renderProp();renderSizing();}
   if(page==='dashboard')renderOpens();
 }
 function renderStats(){
@@ -1680,6 +1735,37 @@ function propAct(action){
   fetch('/prop?action='+action).then(function(){propFormInit=false;return refresh();}).catch(function(e){alert('Fehler: '+e.message);});
 }
 
+/* ---------- sizing ---------- */
+var sizingInit=false;
+function szLabel(key){
+  var el=document.getElementById('s_'+key),lab=document.getElementById('v_'+key);if(!el||!lab)return;
+  var v=parseFloat(el.value);
+  lab.textContent=(key==='riskEur')?(Math.round(v)+' €'):v.toFixed(2);
+}
+function renderSizing(){
+  var s=data?data.sizing:null;if(!s)return;
+  var sx=document.getElementById('s_lotXau'),sn=document.getElementById('s_lotNdx'),sr=document.getElementById('s_riskEur');
+  if(!sx||!sn||!sr)return;
+  if(s.normLotMax){sx.max=s.normLotMax;sn.max=s.normLotMax;} if(s.propRiskMax){sr.max=s.propRiskMax;}
+  if(!sizingInit){ sx.value=s.normLotXau; sn.value=s.normLotNdx; sr.value=s.propRiskEur; sizingInit=true; }
+  szLabel('lotXau');szLabel('lotNdx');szLabel('riskEur');
+  // Modus
+  var prop=!!s.propRiskEnabled;
+  document.getElementById('sm_norm').className='mbtn'+(prop?'':' on');
+  document.getElementById('sm_prop').className='mbtn'+(prop?' on':'');
+  document.getElementById('sz_norm').className=prop?'hide':'';
+  document.getElementById('sz_prop').className=prop?'':'hide';
+  var hint=document.getElementById('riskHint');
+  if(hint&&s.propRiskRecommended){hint.innerHTML='Empfohlen: <b>'+s.propRiskRecommended+' €</b> · der Bot rechnet die Lot selbst, sodass jeder Trade ~gleich viel riskiert — egal wie weit der Stop.';}
+}
+function sizingMode(prop){
+  fetch('/sizing?action=mode&prop='+(prop?'1':'0')).then(function(){return refresh();}).catch(function(e){alert('Fehler: '+e.message);});
+}
+function saveSizing(){
+  var sx=document.getElementById('s_lotXau').value,sn=document.getElementById('s_lotNdx').value,sr=document.getElementById('s_riskEur').value;
+  fetch('/sizing?action=save&lotXau='+sx+'&lotNdx='+sn+'&riskEur='+sr).then(function(){return refresh();}).catch(function(e){alert('Fehler: '+e.message);});
+}
+
 /* ---------- control ---------- */
 function resumeTxt(ts){if(!ts)return '';try{return new Date(ts).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})+' Uhr';}catch(e){return '';}}
 function ctrl(action,min){
@@ -1824,6 +1910,7 @@ const server = http.createServer((req, res) => {
       time: getBerlinTime(), date: getBerlinDate(),
       paused: tradingPaused(), pauseUntil,
       prop: computeProp(),
+      sizing: { ...lotConfig, normLotMax: NORM_LOT_MAX, propRiskMax: PROP_RISK_MAX, propRiskRecommended: PROP_RISK_RECOMMENDED },
       openTrades: openTrades.map(t => ({ symbol: getAssetLabel(t.symbol), signal: t.signal, type: t.type, entry: t.entry, grade: t.grade || null, tp1Hit: !!t.tp1Hit, tp2Hit: !!t.tp2Hit })),
       signals: signalLog.slice(0, 20),
       strategy: {
@@ -1905,6 +1992,34 @@ const server = http.createServer((req, res) => {
     console.log(`🏦 Prop-Firm: ${msg} (${propConfig.firm || '—'})`);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(JSON.stringify({ ok: true, msg, prop: computeProp() }));
+  }
+
+  // Lot-/Risiko-Sizing (Normal-Lot-Slider / Prop-Risk-Slider / Modus-Umschalter)
+  if (req.method === 'GET' && req.url.startsWith('/sizing')) {
+    const u = new URL(req.url, 'http://localhost');
+    const action = u.searchParams.get('action');
+    const clamp = (k, def, min, max) => {
+      const v = parseFloat(u.searchParams.get(k));
+      if (isNaN(v)) return def;
+      return Math.max(min, Math.min(max, v));
+    };
+    let msg = '';
+    if (action === 'save') {
+      lotConfig.normLotXau = clamp('lotXau', lotConfig.normLotXau, 0.01, NORM_LOT_MAX);
+      lotConfig.normLotNdx = clamp('lotNdx', lotConfig.normLotNdx, 0.01, NORM_LOT_MAX);
+      lotConfig.propRiskEur = clamp('riskEur', lotConfig.propRiskEur, 1, PROP_RISK_MAX);
+      msg = 'Sizing gespeichert';
+    } else if (action === 'mode') {
+      lotConfig.propRiskEnabled = u.searchParams.get('prop') === '1';
+      msg = lotConfig.propRiskEnabled ? 'Prop-Risk-Modus AN' : 'Normal-Modus (feste Lot)';
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, error: 'Unbekannte action' }));
+    }
+    saveState();
+    console.log(`📏 Sizing: ${msg} · Gold ${lotConfig.normLotXau} · NAS ${lotConfig.normLotNdx} · Risk ${lotConfig.propRiskEur}€`);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify({ ok: true, msg, sizing: lotConfig }));
   }
 
   // Dashboard HTML
@@ -2002,7 +2117,7 @@ const server = http.createServer((req, res) => {
                   openTrades.push(swTrade);
                   const swEx = tradingPaused()
                     ? { positionId: 'DRY-' + Date.now(), brokerEntry: sw.cur }   // Pause: virtuell tracken, keine echte Order
-                    : await broker.openTrade({ sessionKey, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp3, type: 'swing', tag: swingKey });
+                    : await broker.openTrade({ sessionKey, signal: sw.signal, entry: sw.cur, sl: sw.sl, tp: sw.tp3, type: 'swing', tag: swingKey, ...sizingFor(sessionKey, 'swing') });
                   if (swEx) { swTrade.positionId = swEx.positionId; swTrade.brokerEntry = swEx.brokerEntry; swTrade.lot = swEx.volume; }
                   await sendTelegram(buildSwingSignalMsg(
                     sw.signal, assetLabel, sw.cur, sw.sl, sw.tp1, sw.tp2, sw.tp3, sw.rr, sw.rsi, sw.trend, swTrade.lot
@@ -2076,7 +2191,7 @@ const server = http.createServer((req, res) => {
               openTrades.push(orTrade);
               const orEx = tradingPaused()
                 ? { positionId: 'DRY-' + Date.now(), brokerEntry: parseFloat(close.toFixed(2)) }   // Pause: nur tracken
-                : await broker.openTrade({ sessionKey, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp: tp3, type: 'opening_range', tag: normSym });
+                : await broker.openTrade({ sessionKey, signal: bo, entry: parseFloat(close.toFixed(2)), sl, tp: tp3, type: 'opening_range', tag: normSym, ...sizingFor(sessionKey, 'opening_range') });
               if (orEx) { orTrade.positionId = orEx.positionId; orTrade.brokerEntry = orEx.brokerEntry; orTrade.lot = orEx.volume; }
               await sendTelegram(buildOpeningRangeSignalMsg(bo, assetLabel, close, sl, tp1, tp2, tp3, rr, sd.lastBias, trend15m, orTrade.lot));
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: bo, type: 'Opening Range', grade: null, entry: parseFloat(close.toFixed(2)) });
@@ -2117,7 +2232,7 @@ const server = http.createServer((req, res) => {
               openTrades.push(scTrade);
               const scEx = tradingPaused()
                 ? { positionId: 'DRY-' + Date.now(), brokerEntry: result.cur }   // Pause: nur tracken
-                : await broker.openTrade({ sessionKey, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp3, type: 'scalp', tag: normSym });
+                : await broker.openTrade({ sessionKey, signal: result.signal, entry: result.cur, sl: result.sl, tp: result.tp3, type: 'scalp', tag: normSym, ...sizingFor(sessionKey, 'scalp') });
               if (scEx) { scTrade.positionId = scEx.positionId; scTrade.brokerEntry = scEx.brokerEntry; scTrade.lot = scEx.volume; }
               await sendTelegram(buildSignalMsg(result.signal, assetLabel, result.cur, result.sl, result.tp1, result.tp2, result.tp3, result.rr, result.rsi, result.macd, bias, trend15m, result.liqTarget, result.sweptLiquidity, result.grade, result.score, result.factors, scTrade.lot));
               logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: result.signal, type: 'Scalp', grade: result.grade, entry: result.cur });
