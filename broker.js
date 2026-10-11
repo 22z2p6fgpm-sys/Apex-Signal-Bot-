@@ -105,18 +105,29 @@ function roundVolume(v, spec) {
 // damit der Preis-Versatz (TradingView vs. Vantage) egal ist.
 //   entry/sl/tp = TradingView-Preise (nur zur Abstands-Berechnung genutzt)
 // Rückgabe: { positionId, brokerEntry } oder null.
-async function openTrade({ sessionKey, signal, entry, sl, tp, type, tag }) {
+// Rohes Zielvolumen bestimmen (vor dem Runden auf die Broker-Schrittweite).
+// Priorität:
+//   1. riskEur    → Prop-Risk-Modus: Lot so, dass der SL ~riskEur Verlust bedeutet (alle Typen)
+//   2. lotOverride → fester Lot aus dem Dashboard (Normal-Modus, Scalp/Range)
+//   3. Swing-Default → risiko-basiert (SWING_RISK_EUR)
+//   4. sonst       → feste LOT_MAP (Env-Fallback)
+function rawVolume({ sessionKey, type, slDist, lotOverride, riskEur }) {
+  const eurPer = EUR_PER_PRICE[sessionKey];
+  if (riskEur > 0 && eurPer > 0 && slDist > 0) return riskEur / (slDist * eurPer);
+  if (lotOverride > 0) return lotOverride;
+  if (type === 'swing' && RISK_SWING_EUR > 0 && eurPer > 0 && slDist > 0) return RISK_SWING_EUR / (slDist * eurPer);
+  return LOT_MAP[sessionKey];
+}
+
+async function openTrade({ sessionKey, signal, entry, sl, tp, type, tag, lotOverride, riskEur }) {
   const symbol = SYMBOL_MAP[sessionKey];
   const slDist = Math.abs(entry - sl);   // Abstand Entry→SL (aus TradingView-Preisen)
   const tpDist = Math.abs(tp - entry);   // Abstand Entry→TP3
 
   if (!EXECUTE) {
     // Auch im Dry-Run die geplante Lot berechnen, damit die Anzeige stimmt
-    let dryVol = LOT_MAP[sessionKey];
-    if (type === 'swing' && RISK_SWING_EUR > 0 && EUR_PER_PRICE[sessionKey] > 0 && slDist > 0) {
-      dryVol = Math.max(0.01, Math.floor((RISK_SWING_EUR / (slDist * EUR_PER_PRICE[sessionKey])) / 0.01) * 0.01);
-      dryVol = parseFloat(dryVol.toFixed(2));
-    }
+    const raw = rawVolume({ sessionKey, type, slDist, lotOverride, riskEur });
+    const dryVol = parseFloat(Math.max(0.01, Math.floor(raw / 0.01) * 0.01).toFixed(2));
     console.log(`🧪 [DRY-RUN] würde öffnen: ${signal} ${symbol} (${type} · ${dryVol} Lot · SL-Abstand ${slDist.toFixed(2)})`);
     return { positionId: `DRY-${Date.now()}`, brokerEntry: entry, volume: dryVol };
   }
@@ -127,15 +138,15 @@ async function openTrade({ sessionKey, signal, entry, sl, tp, type, tag }) {
     const spec = await getSpec(symbol);
     const d = (typeof spec.digits === 'number') ? spec.digits : 2;
 
-    // ── Volumen bestimmen ──
-    // Swing: risiko-basiert (SL ≈ SWING_RISK_EUR). Scalp/Range: feste Lot.
-    let volume;
-    if (type === 'swing' && RISK_SWING_EUR > 0 && EUR_PER_PRICE[sessionKey] > 0 && slDist > 0) {
-      const raw = RISK_SWING_EUR / (slDist * EUR_PER_PRICE[sessionKey]);
-      volume = roundVolume(raw, spec);
-      console.log(`🎯 Swing-Sizing ${symbol}: ${RISK_SWING_EUR}€ / (${slDist.toFixed(2)} × ${EUR_PER_PRICE[sessionKey]}€) → ${volume} Lot (~${(volume * slDist * EUR_PER_PRICE[sessionKey]).toFixed(0)}€ Risiko)`);
-    } else {
-      volume = LOT_MAP[sessionKey];
+    // ── Volumen bestimmen ── (Prop-Risk → Lot-Override → Swing-Default → LOT_MAP)
+    const raw = rawVolume({ sessionKey, type, slDist, lotOverride, riskEur });
+    const volume = roundVolume(raw, spec);
+    if (riskEur > 0 && EUR_PER_PRICE[sessionKey] > 0 && slDist > 0) {
+      console.log(`🎯 Prop-Risk ${symbol}: ${riskEur}€ / (${slDist.toFixed(2)} × ${EUR_PER_PRICE[sessionKey]}€) → ${volume} Lot (~${(volume * slDist * EUR_PER_PRICE[sessionKey]).toFixed(0)}€ Risiko)`);
+    } else if (lotOverride > 0) {
+      console.log(`📏 Fester Lot ${symbol}: ${volume} (Dashboard-Slider)`);
+    } else if (type === 'swing') {
+      console.log(`🎯 Swing-Sizing ${symbol}: ${RISK_SWING_EUR}€ → ${volume} Lot (~${(volume * slDist * EUR_PER_PRICE[sessionKey]).toFixed(0)}€ Risiko)`);
     }
 
     const label = `${signal} ${symbol} (${type}, ${volume} Lot · SL-Abstand ${slDist.toFixed(2)} · TP-Abstand ${tpDist.toFixed(2)})`;
