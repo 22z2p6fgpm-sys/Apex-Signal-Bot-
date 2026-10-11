@@ -1086,10 +1086,80 @@ function tradingPaused() {
   return pauseUntil != null;
 }
 
+// ─── PROP-FIRM-MODUS (über das Dashboard konfigurierbar) ──────────────────────
+// Reines Tracking gegen die Challenge-Regeln (Phase 1). Der harte Auto-Stop +
+// echte Broker-Equity ist bewusst noch NICHT dran (Phase 2, braucht echtes Konto).
+let propConfig = {
+  enabled: false,
+  firm: '',
+  accountSize: 100000,   // Start-Balance der Challenge (Konto-Währung)
+  profitTargetPct: 8,    // Gewinnziel in %
+  dailyLossPct: 5,       // max. Tagesverlust in %
+  maxDrawdownPct: 10,    // max. Gesamt-Drawdown in %
+  minDays: 0,            // Mindest-Handelstage (0 = keine)
+  startTs: null,         // Beginn der laufenden Challenge-Auswertung
+};
+
+// Rechnet den aktuellen Prop-Firm-Stand aus der persistenten Trade-Historie.
+// Alle Beträge sind die GETRACKTEN (geschätzten) EUR-Werte — fürs Demo-Tracking ok,
+// die echte Broker-Equity kommt in Phase 2 dazu.
+function computeProp() {
+  const c = propConfig;
+  if (!c.enabled) return { enabled: false };
+  const start = c.startTs || 0;
+  const rows = tradeHistory.filter(t => t.ts >= start);
+  const today = getBerlinDate();
+
+  let total = 0, todayPnl = 0, peak = 0, cum = 0, maxDD = 0;
+  const days = {};
+  for (const t of rows) {
+    const p = (typeof t.pnl === 'number') ? t.pnl : 0;
+    total += p;
+    cum += p;
+    if (cum > peak) peak = cum;
+    const dd = peak - cum;              // Rückgang vom Höchststand
+    if (dd > maxDD) maxDD = dd;
+    if (t.date === today) todayPnl += p;
+    days[t.date] = true;
+  }
+
+  const targetEur  = c.accountSize * c.profitTargetPct / 100;
+  const dailyEur   = c.accountSize * c.dailyLossPct    / 100;
+  const maxDdEur   = c.accountSize * c.maxDrawdownPct  / 100;
+  const tradingDays = Object.keys(days).length;
+
+  // Ampel-Status je Regel
+  const targetPct = targetEur > 0 ? Math.max(0, Math.min(100, total / targetEur * 100)) : 0;
+  const dailyUsedPct = dailyEur > 0 ? Math.max(0, Math.min(100, -Math.min(0, todayPnl) / dailyEur * 100)) : 0;
+  const ddUsedPct = maxDdEur > 0 ? Math.max(0, Math.min(100, maxDD / maxDdEur * 100)) : 0;
+
+  const targetHit = total >= targetEur;
+  const dailyBreached = (-todayPnl) >= dailyEur;
+  const ddBreached = maxDD >= maxDdEur;
+  const daysOk = tradingDays >= c.minDays;
+
+  let status = 'laufend';
+  if (dailyBreached || ddBreached) status = 'verletzt';
+  else if (targetHit && daysOk) status = 'bestanden';
+  else if (targetHit && !daysOk) status = 'ziel erreicht – noch Tage offen';
+
+  return {
+    enabled: true, firm: c.firm, accountSize: c.accountSize,
+    profitTargetPct: c.profitTargetPct, dailyLossPct: c.dailyLossPct,
+    maxDrawdownPct: c.maxDrawdownPct, minDays: c.minDays, startTs: c.startTs,
+    total: +total.toFixed(2), todayPnl: +todayPnl.toFixed(2), maxDD: +maxDD.toFixed(2),
+    targetEur: +targetEur.toFixed(0), dailyEur: +dailyEur.toFixed(0), maxDdEur: +maxDdEur.toFixed(0),
+    targetPct: +targetPct.toFixed(1), dailyUsedPct: +dailyUsedPct.toFixed(1), ddUsedPct: +ddUsedPct.toFixed(1),
+    tradingDays, targetHit, dailyBreached, ddBreached, daysOk, status,
+    dailyRemain: +(dailyEur + Math.min(0, todayPnl)).toFixed(0),   // verbleibender Tagespuffer
+    ddRemain: +(maxDdEur - maxDD).toFixed(0),                      // verbleibender DD-Puffer
+  };
+}
+
 function saveState() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent, pauseUntil, sessionData, dailyFlags };
+    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent, pauseUntil, sessionData, dailyFlags, propConfig };
     fs.writeFileSync(STATE_FILE, JSON.stringify(state));
   } catch (e) {
     console.warn('⚠️ State speichern fehlgeschlagen (Volume auf /data gemountet?):', e.message);
@@ -1122,6 +1192,7 @@ function loadState() {
     if (Array.isArray(s.tradeHistory)) { tradeHistory.length = 0; tradeHistory.push(...s.tradeHistory); }
     if (s.weeklyLastSent) weeklyReport.lastSent = s.weeklyLastSent;
     if (typeof s.pauseUntil === 'number') pauseUntil = s.pauseUntil;
+    if (s.propConfig) Object.assign(propConfig, s.propConfig);
     if (s.sessionData) for (const k of ['XAUUSD', 'NDX']) { if (s.sessionData[k]) Object.assign(sessionData[k], s.sessionData[k]); }
     if (s.dailyFlags) Object.assign(dailyFlags, s.dailyFlags);
     const age = s.savedAt ? Math.round((Date.now() - s.savedAt) / 1000) : '?';
@@ -1270,6 +1341,24 @@ svg.eq{width:100%;height:150px;display:block}
 
 .empty{text-align:center;padding:30px;color:var(--dim);font-size:13px}
 .hide{display:none}
+/* Prop firm */
+.propform{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px}
+.fld{display:flex;flex-direction:column;gap:6px}
+.fld span{font-size:11px;color:var(--dim);font-weight:500}
+.fld input{font-family:var(--mono);font-weight:700;font-size:14px;padding:11px 12px;border-radius:11px;background:rgba(7,7,16,.6);color:var(--txt);border:1px solid var(--line2)}
+.fld input::placeholder{color:var(--dim)}
+.propbtns{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:12px}
+.propnote{font-size:11.5px;color:var(--dim);line-height:1.5;padding:11px 13px;border-radius:11px;background:var(--glass);border:1px solid var(--line)}
+.propbanner{border-radius:17px;padding:17px 19px;margin-bottom:16px;border:1px solid var(--line2);background:var(--glass)}
+.propbanner .bfirm{font-size:13px;font-weight:700;letter-spacing:.01em}
+.propbanner .bstat{font-size:12px;font-weight:700;padding:3px 10px;border-radius:8px;float:right}
+.bs-run{background:rgba(57,227,255,.14);color:var(--cyan)} .bs-pass{background:rgba(34,230,160,.16);color:var(--profit)} .bs-fail{background:rgba(255,78,106,.16);color:var(--loss)} .bs-wait{background:rgba(244,179,61,.16);color:var(--gold)}
+.pmeter{margin-top:14px}
+.pmeter .plab{display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px}
+.pmeter .plab .pv{font-family:var(--mono);font-weight:700}
+.pbar{height:9px;border-radius:6px;background:rgba(7,7,16,.6);overflow:hidden}
+.pbar span{display:block;height:100%;border-radius:6px;transition:width .5s ease}
+.pf-ok{background:linear-gradient(90deg,#22E6A0,#39E3FF)} .pf-warn{background:linear-gradient(90deg,#F4B33D,#FF4E6A)} .pf-bad{background:linear-gradient(90deg,#FF4E6A,#FF4E6A)}
 .foot{text-align:center;margin-top:26px;font-size:11px;color:var(--dim);opacity:.6;font-family:var(--mono)}
 
 @media(max-width:620px){
@@ -1293,6 +1382,7 @@ svg.eq{width:100%;height:150px;display:block}
     <div class="nav" id="n-signals" onclick="nav('signals')" title="Signale"><svg viewBox="0 0 24 24"><path d="M5 12a7 7 0 0114 0"/><path d="M8 12a4 4 0 018 0"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/></svg></div>
     <div class="nav" id="n-history" onclick="nav('history')" title="Verlauf"><svg viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 16l5-5 4 3 7-8"/></svg></div>
     <div class="nav" id="n-strategy" onclick="nav('strategy')" title="Strategie"><svg viewBox="0 0 24 24"><path d="M5 5v14M12 5v14M19 5v14"/><circle cx="5" cy="10" r="2.2" fill="var(--void)"/><circle cx="12" cy="15" r="2.2" fill="var(--void)"/><circle cx="19" cy="9" r="2.2" fill="var(--void)"/></svg></div>
+    <div class="nav" id="n-prop" onclick="nav('prop')" title="Prop Firm"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
     <div class="pulse" id="railpulse"></div>
   </div>
   <div class="main">
@@ -1341,6 +1431,25 @@ svg.eq{width:100%;height:150px;display:block}
     </div>
     <!-- STRATEGY -->
     <div id="v-strategy" class="hide"><div class="sect">Strategie &amp; Filter</div><div id="strat"></div></div>
+    <!-- PROP FIRM -->
+    <div id="v-prop" class="hide">
+      <div id="propStatus"></div>
+      <div class="sect">Challenge-Regeln</div>
+      <div class="propform">
+        <label class="fld"><span>Prop Firm</span><input id="p_firm" type="text" maxlength="40" placeholder="z.B. FTMO"></label>
+        <label class="fld"><span>Account-Größe</span><input id="p_size" type="number" min="100" placeholder="100000"></label>
+        <label class="fld"><span>Profit-Target %</span><input id="p_target" type="number" step="0.1" min="0.1" placeholder="8"></label>
+        <label class="fld"><span>Daily-Loss %</span><input id="p_daily" type="number" step="0.1" min="0.1" placeholder="5"></label>
+        <label class="fld"><span>Max-Drawdown %</span><input id="p_dd" type="number" step="0.1" min="0.1" placeholder="10"></label>
+        <label class="fld"><span>Min. Handelstage</span><input id="p_days" type="number" min="0" placeholder="0"></label>
+      </div>
+      <div class="propbtns">
+        <button class="cbtn go" onclick="saveProp()">💾 Regeln speichern</button>
+        <button class="cbtn pz" onclick="propAct('reset')">↺ Challenge neu starten</button>
+        <button class="cbtn" onclick="propAct('off')">Prop-Modus aus</button>
+      </div>
+      <div class="propnote">Phase 1: reines Tracking auf Basis der getrackten (geschätzten) P&amp;L. Der harte Auto-Stop und die echte Broker-Equity kommen in Phase 2 — erst mit echtem Prop-MT5.</div>
+    </div>
 
     <div class="foot">Aktualisiert alle 5s · Apex Signal Bot</div>
   </div>
@@ -1348,8 +1457,8 @@ svg.eq{width:100%;height:150px;display:block}
 <script>
 var cur='combined',page='dashboard',data=null,lastEq='';
 var RM=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-var VIEWS=['dashboard','positions','signals','history','strategy'];
-var TITLES={dashboard:'Dashboard',positions:'Positionen',signals:'Signale',history:'Verlauf',strategy:'Strategie'};
+var VIEWS=['dashboard','positions','signals','history','strategy','prop'];
+var TITLES={dashboard:'Dashboard',positions:'Positionen',signals:'Signale',history:'Verlauf',strategy:'Strategie',prop:'Prop Firm'};
 
 /* ---------- number formatting + count-up ---------- */
 function fmt(v,dec,pre,suf,sign){
@@ -1415,6 +1524,7 @@ function render(){
   if(page==='signals')renderSignals();
   if(page==='history')renderHistory();
   if(page==='strategy')renderStrategy();
+  if(page==='prop')renderProp();
   if(page==='dashboard')renderOpens();
 }
 function renderStats(){
@@ -1509,6 +1619,65 @@ function drawEq(eq){
     if(!document.getElementById('eqkf')){var s=document.createElement('style');s.id='eqkf';s.textContent='@keyframes draw{to{stroke-dashoffset:0}}';document.head.appendChild(s);}
   }
   lastEq=key;
+}
+
+/* ---------- prop firm ---------- */
+var propFormInit=false;
+function eur(v){return (v>=0?'+':'')+'$'+Number(v).toLocaleString('de-DE',{maximumFractionDigits:0});}
+function meter(label,valueTxt,pct,mode){
+  var cls=mode==='bad'?'pf-bad':mode==='warn'?'pf-warn':'pf-ok';
+  return '<div class="pmeter"><div class="plab"><span>'+label+'</span><span class="pv">'+valueTxt+'</span></div><div class="pbar"><span class="'+cls+'" style="width:'+Math.max(2,Math.min(100,pct))+'%"></span></div></div>';
+}
+function renderProp(){
+  var p=data?data.prop:null;
+  // Formular einmalig mit gespeicherten Werten füllen
+  if(p&&p.enabled&&!propFormInit){
+    document.getElementById('p_firm').value=p.firm||'';
+    document.getElementById('p_size').value=p.accountSize;
+    document.getElementById('p_target').value=p.profitTargetPct;
+    document.getElementById('p_daily').value=p.dailyLossPct;
+    document.getElementById('p_dd').value=p.maxDrawdownPct;
+    document.getElementById('p_days').value=p.minDays;
+    propFormInit=true;
+  }
+  var box=document.getElementById('propStatus');
+  if(!p||!p.enabled){
+    box.innerHTML='<div class="propbanner"><div class="bfirm">Noch keine Challenge aktiv</div><div style="font-size:12px;color:var(--dim);margin-top:6px">Trag unten deine Firma und die Regeln ein und speichere — dann trackt der Bot live mit.</div></div>';
+    return;
+  }
+  // Status-Chip
+  var chip,chipTxt;
+  if(p.dailyBreached||p.ddBreached){chip='bs-fail';chipTxt='Regel verletzt';}
+  else if(p.targetHit&&p.daysOk){chip='bs-pass';chipTxt='Bestanden 🏆';}
+  else if(p.targetHit){chip='bs-wait';chipTxt='Ziel erreicht — Tage offen';}
+  else{chip='bs-run';chipTxt='Läuft';}
+  // Target-Meter (mehr = besser)
+  var tgtMode=p.targetHit?'ok':'ok';
+  var tgt=meter('Profit-Target · Ziel '+eur(p.targetEur),eur(p.total)+' · '+p.targetPct.toFixed(0)+'%',p.targetPct,tgtMode);
+  // Daily-Loss-Meter (mehr verbraucht = schlechter)
+  var dMode=p.dailyBreached?'bad':p.dailyUsedPct>=70?'warn':'ok';
+  var dly=meter('Daily-Loss · Limit '+eur(-p.dailyEur),'Puffer '+eur(p.dailyRemain)+' · '+p.dailyUsedPct.toFixed(0)+'% weg',p.dailyUsedPct,dMode);
+  // Drawdown-Meter
+  var ddMode=p.ddBreached?'bad':p.ddUsedPct>=70?'warn':'ok';
+  var ddm=meter('Max-Drawdown · Limit '+eur(-p.maxDdEur),'Puffer '+eur(p.ddRemain)+' · '+p.ddUsedPct.toFixed(0)+'% weg',p.ddUsedPct,ddMode);
+  // Tage
+  var daysm='<div class="pmeter"><div class="plab"><span>Handelstage · min. '+p.minDays+'</span><span class="pv">'+p.tradingDays+(p.daysOk?' ✅':'')+'</span></div></div>';
+  box.innerHTML='<div class="propbanner"><span class="bstat '+chip+'">'+chipTxt+'</span><div class="bfirm">'+(p.firm||'Prop Firm')+' · '+eur(p.accountSize).replace('+','')+'</div>'+tgt+dly+ddm+daysm+'</div>';
+}
+function saveProp(){
+  var q='/prop?action=save'
+    +'&firm='+encodeURIComponent(document.getElementById('p_firm').value||'')
+    +'&accountSize='+encodeURIComponent(document.getElementById('p_size').value||'100000')
+    +'&profitTargetPct='+encodeURIComponent(document.getElementById('p_target').value||'8')
+    +'&dailyLossPct='+encodeURIComponent(document.getElementById('p_daily').value||'5')
+    +'&maxDrawdownPct='+encodeURIComponent(document.getElementById('p_dd').value||'10')
+    +'&minDays='+encodeURIComponent(document.getElementById('p_days').value||'0');
+  fetch(q).then(function(){propFormInit=false;return refresh();}).catch(function(e){alert('Fehler: '+e.message);});
+}
+function propAct(action){
+  if(action==='reset'&&!confirm('Challenge-Zähler wirklich auf 0 setzen?'))return;
+  if(action==='off'&&!confirm('Prop-Modus ausschalten?'))return;
+  fetch('/prop?action='+action).then(function(){propFormInit=false;return refresh();}).catch(function(e){alert('Fehler: '+e.message);});
 }
 
 /* ---------- control ---------- */
@@ -1654,6 +1823,7 @@ const server = http.createServer((req, res) => {
     const payload = {
       time: getBerlinTime(), date: getBerlinDate(),
       paused: tradingPaused(), pauseUntil,
+      prop: computeProp(),
       openTrades: openTrades.map(t => ({ symbol: getAssetLabel(t.symbol), signal: t.signal, type: t.type, entry: t.entry, grade: t.grade || null, tp1Hit: !!t.tp1Hit, tp2Hit: !!t.tp2Hit })),
       signals: signalLog.slice(0, 20),
       strategy: {
@@ -1699,6 +1869,42 @@ const server = http.createServer((req, res) => {
     console.log(`⏯ Trading-Steuerung: ${msg}`);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(JSON.stringify({ ok: true, msg, paused: pauseUntil != null, pauseUntil }));
+  }
+
+  // Prop-Firm-Konfiguration (speichern / Challenge starten / aus)
+  if (req.method === 'GET' && req.url.startsWith('/prop')) {
+    const u = new URL(req.url, 'http://localhost');
+    const action = u.searchParams.get('action');
+    const num = (k, def, min, max) => {
+      const v = parseFloat(u.searchParams.get(k));
+      if (isNaN(v)) return def;
+      return Math.max(min, Math.min(max, v));
+    };
+    let msg = '';
+    if (action === 'save') {
+      propConfig.firm = (u.searchParams.get('firm') || '').slice(0, 40);
+      propConfig.accountSize    = num('accountSize', propConfig.accountSize, 100, 100000000);
+      propConfig.profitTargetPct = num('profitTargetPct', propConfig.profitTargetPct, 0.1, 100);
+      propConfig.dailyLossPct    = num('dailyLossPct', propConfig.dailyLossPct, 0.1, 100);
+      propConfig.maxDrawdownPct  = num('maxDrawdownPct', propConfig.maxDrawdownPct, 0.1, 100);
+      propConfig.minDays         = Math.round(num('minDays', propConfig.minDays, 0, 365));
+      propConfig.enabled = true;
+      if (!propConfig.startTs) propConfig.startTs = Date.now();   // Challenge beginnt beim ersten Speichern
+      msg = 'Regeln gespeichert';
+    } else if (action === 'reset') {
+      propConfig.startTs = Date.now();   // Auswertung ab jetzt neu
+      msg = 'Challenge neu gestartet (Zähler auf 0)';
+    } else if (action === 'off') {
+      propConfig.enabled = false;
+      msg = 'Prop-Modus aus';
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, error: 'Unbekannte action' }));
+    }
+    saveState();
+    console.log(`🏦 Prop-Firm: ${msg} (${propConfig.firm || '—'})`);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify({ ok: true, msg, prop: computeProp() }));
   }
 
   // Dashboard HTML
