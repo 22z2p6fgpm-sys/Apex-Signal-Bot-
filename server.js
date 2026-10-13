@@ -565,6 +565,10 @@ function logSignal(entry) {
 }
 const lastTradeTime = {};
 
+// Für Diagnose: seit dem letzten Start — kommen überhaupt Webhooks an?
+const BOOT_TS = Date.now();
+const webhookStats = { total: 0, lastTs: null, perSym: { XAUUSD: 0, NDX: 0 } };
+
 // ── Dauerhafte Trade-Historie (persistiert) — Basis für die Weekly Summary ──
 const tradeHistory = [];
 const weeklyReport = { lastSent: null };  // Datum des letzten Freitag-Reports
@@ -1179,6 +1183,69 @@ function computeProp() {
   };
 }
 
+// ─── DIAGNOSE-REPORT (ein Klick im Dashboard → alles für Claude) ──────────────
+function diagAgo(ts) {
+  if (!ts) return 'nie';
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return 'vor ' + s + 's';
+  if (s < 3600) return 'vor ' + Math.round(s / 60) + 'min';
+  return 'vor ' + Math.round(s / 3600) + 'h';
+}
+function diagDur(ms) {
+  const s = Math.round(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return (h ? h + 'h ' : '') + m + 'min';
+}
+function buildDiag() {
+  const bs = broker.status();
+  const paused = tradingPaused();
+  const needSw = CONFIG.SWING_EMA_SLOW + 5;
+  const L = [];
+  L.push('=== APEX DIAG · ' + getBerlinDate() + ' ' + getBerlinTime() + ' ===');
+  L.push('Uptime: ' + diagDur(Date.now() - BOOT_TS));
+  L.push('Broker: ' + (bs.ready ? 'verbunden' : 'NICHT verbunden') + ' · EXECUTE ' + (bs.execute ? 'AN' : 'AUS') + ' · offen ' + bs.openCount + '/' + bs.maxOpen);
+  L.push('Trading: ' + (paused ? ('PAUSIERT (' + diagAgo(pauseUntil) + ' Restziel)') : 'aktiv'));
+  L.push(lotConfig.propRiskEnabled
+    ? ('Sizing: PROP-RISK ' + lotConfig.propRiskEur + '€/Trade')
+    : ('Sizing: NORMAL · Gold ' + lotConfig.normLotXau + ' / NAS ' + lotConfig.normLotNdx + ' Lot · Swing risiko-basiert'));
+  L.push('');
+  L.push('-- Webhooks seit Start --');
+  L.push('Gesamt ' + webhookStats.total + ' · zuletzt ' + diagAgo(webhookStats.lastTs) + ' · XAU ' + webhookStats.perSym.XAUUSD + ' · NDX ' + webhookStats.perSym.NDX);
+  L.push('');
+  L.push('-- Kerzen --');
+  L.push('XAU: Scalp ' + store.XAUUSD.closes.length + ' · Swing ' + swingStore.XAUUSD.closes.length + (swingStore.XAUUSD.closes.length >= needSw ? ' OK' : '/' + needSw));
+  L.push('NDX: Scalp ' + store.NDX.closes.length + ' · Swing ' + swingStore.NDX.closes.length + (swingStore.NDX.closes.length >= needSw ? ' OK' : '/' + needSw));
+  for (const k of ['XAUUSD', 'NDX']) {
+    const sd = sessionData[k], p = sd.performance;
+    L.push('');
+    L.push('-- ' + getAssetLabel(k) + ' --');
+    L.push('Bias ' + (sd.lastBias || '-') + ' (gesendet ' + sd.biasSent + ') · Asia H ' + (sd.asiaHigh ?? '-') + '/L ' + (sd.asiaLow ?? '-'));
+    L.push('Heute ' + p.wins + 'W/' + p.losses + 'L · Serie ' + p.streak + '× ' + (p.streakType || '-') + ' · letzter Signal-Key ' + (store[k].lastSignal || '-'));
+  }
+  const pr = computeProp();
+  L.push('');
+  L.push('-- Prop --');
+  L.push(pr.enabled
+    ? (pr.firm + ' ' + pr.accountSize + '€ · Total ' + pr.total + '/Ziel ' + pr.targetEur + ' (' + pr.targetPct + '%) · Daily-Puffer ' + pr.dailyRemain + ' · DD-Puffer ' + pr.ddRemain + ' · ' + pr.status)
+    : 'aus');
+  L.push('');
+  L.push('-- Offene Trades (' + openTrades.length + ') --');
+  if (openTrades.length) openTrades.slice(0, 10).forEach(t => L.push(t.signal + ' ' + getAssetLabel(t.symbol) + ' ' + t.type + (t.grade ? ' ' + t.grade : '') + ' @ ' + t.entry + (t.lot ? ' · ' + t.lot + ' Lot' : '') + (t.tp1Hit ? ' TP1' : '')));
+  else L.push('(keine)');
+  L.push('');
+  L.push('-- Letzte Signale (' + Math.min(8, signalLog.length) + ') --');
+  if (signalLog.length) signalLog.slice(0, 8).forEach(s => L.push(s.time + ' ' + s.signal + ' ' + s.symbol + ' ' + s.type + (s.grade ? ' ' + s.grade : '') + ' @ ' + s.entry));
+  else L.push('(keine seit Start)');
+  L.push('');
+  L.push('-- Letzte Trades (' + Math.min(8, tradeHistory.length) + ') --');
+  if (tradeHistory.length) tradeHistory.slice(-8).reverse().forEach(t => L.push(t.date + ' ' + t.signal + ' ' + t.symbol + ' ' + t.type + ' → ' + t.reason + ' ' + (t.pnl >= 0 ? '+' : '') + t.pnl + '€ (' + t.result + ')'));
+  else L.push('(keine)');
+  L.push('');
+  L.push('-- Config --');
+  L.push('Opening-Range ' + (CONFIG.ENABLE_OPENING_RANGE ? 'AN' : 'AUS') + ' · Cooldown ' + CONFIG.COOLDOWN_MIN + 'min · Bias-Filter ' + CONFIG.REQUIRE_BIAS_ALIGN + ' · MAX_CANDLES ' + CONFIG.MAX_CANDLES);
+  L.push('=== ENDE ===');
+  return L.join('\n');
+}
+
 function saveState() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -1363,6 +1430,9 @@ svg.eq{width:100%;height:150px;display:block}
 .scard{border-radius:16px;padding:16px 18px;background:var(--glass);border:1px solid var(--line);margin-bottom:13px}
 .scard .ch{font-size:12px;color:var(--violet);font-weight:700;margin-bottom:4px}
 
+.diagbar{margin-bottom:16px}
+.diagbtn{width:100%;justify-content:center;border-color:var(--line2)!important;color:var(--cyan)!important}
+.diagarea{width:100%;margin-top:10px;min-height:150px;font-family:var(--mono);font-size:11px;line-height:1.5;padding:12px;border-radius:12px;background:rgba(7,7,16,.7);color:var(--txt);border:1px solid var(--line2);white-space:pre;overflow:auto}
 .empty{text-align:center;padding:30px;color:var(--dim);font-size:13px}
 .hide{display:none}
 /* Prop firm */
@@ -1437,6 +1507,10 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
           <button class="cbtn pz" onclick="ctrl('pause',document.getElementById('cmin').value)">⏸ Pausieren</button>
           <button class="cbtn go" onclick="ctrl('resume')">▶ Aktivieren</button>
         </div>
+      </div>
+      <div class="diagbar">
+        <button class="cbtn diagbtn" id="diagbtn" onclick="copyDiag()">📋 Daten für Claude kopieren</button>
+        <textarea id="diagArea" class="diagarea hide" readonly></textarea>
       </div>
       <div class="tabs">
         <div class="tab on v" id="t-combined" onclick="sw('combined')"><span class="tdot" style="background:var(--violet)"></span>Gesamt</div>
@@ -1775,6 +1849,16 @@ function ctrl(action,min){
 }
 
 /* ---------- data ---------- */
+function copyDiag(){
+  var btn=document.getElementById('diagbtn');
+  var RESET='📋 Daten für Claude kopieren';
+  fetch('/diag').then(function(r){return r.text();}).then(function(txt){
+    function flash(){ if(btn){ btn.textContent='✅ Kopiert — schick es Claude'; setTimeout(function(){btn.textContent=RESET;},2500);} }
+    function fallback(){ var a=document.getElementById('diagArea'); if(a){ a.value=txt; a.className='diagarea'; a.focus(); a.select(); try{document.execCommand('copy');}catch(e){} if(btn)btn.textContent='↓ Text markieren & kopieren'; } }
+    if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(flash,fallback); }
+    else { fallback(); }
+  }).catch(function(e){alert('Fehler: '+e.message);});
+}
 function refresh(){
   return fetch('/data').then(function(r){return r.json();}).then(function(j){
     data=j;
@@ -2022,6 +2106,12 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ ok: true, msg, sizing: lotConfig }));
   }
 
+  // Diagnose-Report (ein Klick im Dashboard → Text für Claude)
+  if (req.method === 'GET' && req.url === '/diag') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(buildDiag());
+  }
+
   // Dashboard HTML
   if (req.method === 'GET' && req.url === '/dashboard') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -2055,6 +2145,11 @@ const server = http.createServer((req, res) => {
         const assetLabel = getAssetLabel(symbol);
         const sessionKey = getSessionKey(symbol);
         const sd = sessionKey ? sessionData[sessionKey] : null;
+
+        // Webhook-Zähler (Diagnose: kommen Signale an?)
+        webhookStats.total++;
+        webhookStats.lastTs = Date.now();
+        if (webhookStats.perSym[sessionKey] != null) webhookStats.perSym[sessionKey]++;
 
         // Kerzen speichern
         st.closes.push(close); st.highs.push(high); st.lows.push(low);
