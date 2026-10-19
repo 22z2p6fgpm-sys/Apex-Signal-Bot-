@@ -1,0 +1,283 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © Noel Kugler · Apex Absorption Zones
+//
+// Was der Indikator macht (Nachbau des "Orderflow Sniper"-Prinzips):
+//  1. Findet Absorptions-Kerzen: viel Volumen, aber kaum Bewegung (+ Docht).
+//     → Viel Aggression wurde von passiven Limit-Orders "geschluckt".
+//  2. Zeichnet daraus Zonen: Verkauf-Absorption = Widerstand, Kauf-Absorption = Unterstützung.
+//     Label in der Zone: Volumen | Delta-Anteil (wie "145 | 58%" im Video).
+//  3. Signal, wenn der Preis eine Zone erneut antestet und abprallt
+//     (SHORT "Trapped Buyers" / LONG "Trapped Sellers"). Ziel = nächste Gegen-Zone.
+//
+// WICHTIG – Datenqualität:
+//  * Echtes Bid/Ask-Volumen gibt es bei TradingView erst ab Premium (Footprint).
+//    Dieser Indikator SCHÄTZT Kauf-/Verkaufsvolumen aus 1-Minuten-Kerzen
+//    (Close-Position in der Kerze). Funktioniert mit Essential.
+//  * Am besten auf Futures (NQ1!, MNQ1!, GC1!, MGC1!) – echtes Börsen-Volumen.
+//    Auf CFDs (XAUUSD, NAS100) ist es nur Tick-Volumen → deutlich ungenauer.
+//  * Für Echtzeit-Futures-Daten brauchst du das CME-Datenpaket, sonst 10 Min verzögert.
+
+//@version=6
+indicator("Apex Absorption Zones", shorttitle = "Apex Abs", overlay = true, max_boxes_count = 200, max_labels_count = 300, max_lines_count = 200)
+
+// ─── Einstellungen ───────────────────────────────────────────────────────────
+grpD = "Daten"
+useLTF  = input.bool(true, "Kauf/Verkauf aus kleineren Kerzen schätzen", group = grpD, tooltip = "Zerlegt jede Chart-Kerze in 1-Minuten-Kerzen und schätzt daraus Kauf- vs. Verkaufsvolumen. Genauer als nur die Chart-Kerze. Chart-Zeiteinheit muss größer sein (z. B. 5 Min).")
+ltfStr  = input.timeframe("1", "Kleinere Zeiteinheit", group = grpD)
+
+grpA = "Absorption"
+volLen    = input.int(20, "Volumen-Durchschnitt (Kerzen)", minval = 5, group = grpA)
+volMult   = input.float(1.8, "Mindest-Volumen (x Durchschnitt)", minval = 1.0, step = 0.1, group = grpA)
+effortMax = input.float(0.6, "Max. Kerzenkörper (x ATR)", minval = 0.1, step = 0.05, group = grpA, tooltip = "Absorption = viel Volumen, aber wenig Bewegung. Kleiner = strenger.")
+wickMin   = input.float(0.45, "Min. Docht-Anteil der Kerze", minval = 0.1, maxval = 0.95, step = 0.05, group = grpA)
+deltaMin  = input.float(0.15, "Min. Delta-Anteil (aggressive Seite)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpA)
+atrLen    = input.int(14, "ATR-Länge", minval = 2, group = grpA)
+maxZones  = input.int(6, "Max. aktive Zonen je Seite", minval = 1, maxval = 40, group = grpA)
+zoneLife  = input.int(300, "Zone verfällt nach (Kerzen)", minval = 10, group = grpA)
+
+grpS = "Signale"
+showSig    = input.bool(true, "Long/Short-Signale anzeigen", group = grpS)
+instantSig = input.bool(false, "Auch direkt an der Absorptions-Kerze (aggressiv)", group = grpS, tooltip = "Signal schon an der Absorptions-Kerze selbst, wenn sie ein neues 20-Kerzen-Hoch/Tief macht und abprallt. Mehr Signale, mehr Fehlsignale.")
+slBuf      = input.float(0.2, "SL-Puffer hinter der Zone (x ATR)", minval = 0.0, step = 0.05, group = grpS)
+minRR      = input.float(1.5, "Mindest-CRV bis zur Gegen-Zone", minval = 0.5, step = 0.1, group = grpS)
+fallbackRR = input.float(2.0, "Ziel ohne Gegen-Zone (x Risiko)", minval = 0.5, step = 0.1, group = grpS)
+useSess    = input.bool(false, "Signale nur in einer Session", group = grpS)
+sessStr    = input.session("0930-1130", "Session (New Yorker Zeit)", group = grpS)
+
+grpV = "Darstellung"
+showBubbles = input.bool(true, "Volumen-Bubbles an Absorptions-Kerzen", group = grpV)
+colSup = input.color(color.new(color.teal, 78), "Unterstützung (Kauf-Absorption)", group = grpV)
+colRes = input.color(color.new(color.orange, 78), "Widerstand (Verkauf-Absorption)", group = grpV)
+
+// ─── Datentypen ──────────────────────────────────────────────────────────────
+type Zone
+    box   bx
+    float top
+    float bot
+    int   dir          // 1 = Unterstützung, -1 = Widerstand
+    float vol
+    int   born
+    bool  used = false
+
+var array<Zone> zones = array.new<Zone>()
+
+// ─── Delta-Schätzung ─────────────────────────────────────────────────────────
+// Kaufanteil ≈ wo die Kerze schließt: Close am Hoch = Käufer, Close am Tief = Verkäufer.
+f_clvDelta(float o, float h, float l, float c, float v) =>
+    float d = 0.0
+    if not na(v) and v > 0
+        float r = h - l
+        if r > 0
+            d := v * ((c - l) - (h - c)) / r
+        else
+            d := c > o ? v : c < o ? -v : 0.0
+    d
+
+ltfIsLower = timeframe.in_seconds() > timeframe.in_seconds(ltfStr)
+ltf = ltfIsLower ? ltfStr : timeframe.period
+[lO, lH, lL, lC, lV] = request.security_lower_tf(syminfo.tickerid, ltf, [open, high, low, close, volume], ignore_invalid_timeframe = true)
+
+float barDelta = 0.0
+bool ltfUsed = false
+if useLTF and ltfIsLower
+    int nI = array.size(lC)
+    if nI > 0
+        ltfUsed := true
+        for i = 0 to nI - 1
+            barDelta += f_clvDelta(array.get(lO, i), array.get(lH, i), array.get(lL, i), array.get(lC, i), array.get(lV, i))
+if not ltfUsed
+    barDelta := f_clvDelta(open, high, low, close, volume)
+
+// ─── Kerzen-Kennzahlen ──────────────────────────────────────────────────────
+atr      = ta.atr(atrLen)
+avgVol   = ta.sma(nz(volume), volLen)
+cumVol   = ta.cum(nz(volume))
+lowest20 = ta.lowest(low, 20)
+highest20 = ta.highest(high, 20)
+
+volOk    = nz(volume) > 0 and cumVol > 0
+rng      = high - low
+bodySize = math.abs(close - open)
+upWick   = high - math.max(open, close)
+dnWick   = math.min(open, close) - low
+deltaPct = volOk ? barDelta / volume : 0.0
+ready    = volOk and not na(atr) and not na(avgVol) and rng > 0
+
+highVol     = ready and volume >= avgVol * volMult
+smallEffort = ready and bodySize <= atr * effortMax
+
+// Verkauf-Absorption: Käufer drücken hoch (langer oberer Docht oder Delta+), Preis kommt nicht weg
+sellCand = highVol and smallEffort and (upWick / rng >= wickMin or (deltaPct >= deltaMin and close <= open))
+// Kauf-Absorption: Verkäufer drücken runter (langer unterer Docht oder Delta-), Preis kommt nicht weg
+buyCand  = highVol and smallEffort and (dnWick / rng >= wickMin or (deltaPct <= -deltaMin and close >= open))
+
+sellAbs = sellCand and (not buyCand or upWick >= dnWick)
+buyAbs  = buyCand and (not sellCand or dnWick > upWick)
+
+inSess = not useSess or not na(time(timeframe.period, sessStr, "America/New_York"))
+
+// ─── Ziel = nächste Gegen-Zone (oder fester Faktor) ─────────────────────────
+f_target(int dir, float entry, float risk) =>
+    float best = na
+    int n = array.size(zones)
+    if n > 0
+        for i = 0 to n - 1
+            Zone z = array.get(zones, i)
+            if dir == 1 and z.dir == -1 and z.bot > entry
+                best := na(best) ? z.bot : math.min(best, z.bot)
+            if dir == -1 and z.dir == 1 and z.top < entry
+                best := na(best) ? z.top : math.max(best, z.top)
+    float tp = na
+    if risk > 0
+        if na(best)
+            tp := entry + dir * risk * fallbackRR
+        else if math.abs(best - entry) / risk >= minRR
+            tp := best
+    tp
+
+// ─── Signale (nur auf geschlossenen Kerzen → kein Repaint) ──────────────────
+bool   longSig  = false
+bool   shortSig = false
+float  sigEntry = na
+float  sigSL    = na
+float  sigTP    = na
+string sigWhy   = ""
+bool   instUsed = false
+
+if barstate.isconfirmed and ready and inSess
+    int iS = -1
+    int iL = -1
+    int nZ = array.size(zones)
+    if nZ > 0
+        for i = 0 to nZ - 1
+            Zone z = array.get(zones, i)
+            if not z.used
+                // Widerstand angetestet, Close wieder darunter, rote Kerze → gefangene Käufer
+                if z.dir == -1 and high >= z.bot and close < z.bot and close < open
+                    if iS == -1
+                        iS := i
+                    else if z.vol > array.get(zones, iS).vol
+                        iS := i
+                // Unterstützung angetestet, Close wieder darüber, grüne Kerze → gefangene Verkäufer
+                if z.dir == 1 and low <= z.top and close > z.top and close > open
+                    if iL == -1
+                        iL := i
+                    else if z.vol > array.get(zones, iL).vol
+                        iL := i
+
+    // Beide Richtungen gleichzeitig = unklar → kein Signal
+    if iS >= 0 and iL < 0
+        Zone zS = array.get(zones, iS)
+        float sl = zS.top + atr * slBuf
+        float tp = f_target(-1, close, sl - close)
+        if not na(tp)
+            shortSig := true
+            zS.used := true
+            box.set_bgcolor(zS.bx, color.new(color.gray, 88))
+            sigEntry := close
+            sigSL := sl
+            sigTP := tp
+            sigWhy := "Trapped Buyers"
+    if iL >= 0 and iS < 0
+        Zone zL = array.get(zones, iL)
+        float sl = zL.bot - atr * slBuf
+        float tp = f_target(1, close, close - sl)
+        if not na(tp)
+            longSig := true
+            zL.used := true
+            box.set_bgcolor(zL.bx, color.new(color.gray, 88))
+            sigEntry := close
+            sigSL := sl
+            sigTP := tp
+            sigWhy := "Trapped Sellers"
+
+    // Aggressiv: direkt an der Absorptions-Kerze am 20er-Extrem
+    if instantSig and not longSig and not shortSig
+        if buyAbs and low <= lowest20 and close > hl2
+            float sl = low - atr * slBuf
+            float tp = f_target(1, close, close - sl)
+            if not na(tp)
+                longSig := true
+                instUsed := true
+                sigEntry := close
+                sigSL := sl
+                sigTP := tp
+                sigWhy := "Absorption am Tief"
+        else if sellAbs and high >= highest20 and close < hl2
+            float sl = high + atr * slBuf
+            float tp = f_target(-1, close, sl - close)
+            if not na(tp)
+                shortSig := true
+                instUsed := true
+                sigEntry := close
+                sigSL := sl
+                sigTP := tp
+                sigWhy := "Absorption am Hoch"
+
+// ─── Zonen pflegen: durchbrochene / alte löschen ────────────────────────────
+if barstate.isconfirmed and array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        Zone z = array.get(zones, i)
+        bool broken  = (z.dir == -1 and close > z.top + nz(atr) * 0.1) or (z.dir == 1 and close < z.bot - nz(atr) * 0.1)
+        bool expired = bar_index - z.born > zoneLife
+        if broken or expired
+            box.delete(z.bx)
+            array.remove(zones, i)
+
+// ─── Neue Zone + Bubble ─────────────────────────────────────────────────────
+if barstate.isconfirmed and (sellAbs or buyAbs)
+    int   dir = buyAbs ? 1 : -1
+    float minH = atr * 0.1
+    float zTop = dir == 1 ? math.max(math.min(open, close), low + minH) : high
+    float zBot = dir == 1 ? low : math.min(math.max(open, close), high - minH)
+    color bg   = dir == 1 ? colSup : colRes
+    string txt = str.tostring(volume, format.volume) + " | " + str.tostring(math.round(math.abs(deltaPct) * 100)) + "%"
+    box bx = box.new(left = bar_index, top = zTop, right = bar_index + 3, bottom = zBot, border_color = color.new(bg, 40), bgcolor = bg, text = txt, text_size = size.small, text_color = chart.fg_color, text_halign = text.align_right)
+    array.push(zones, Zone.new(bx, zTop, zBot, dir, volume, bar_index, instUsed))
+
+    // Älteste Zone dieser Seite löschen, wenn zu viele
+    int cnt = 0
+    int oldest = -1
+    for i = 0 to array.size(zones) - 1
+        Zone z = array.get(zones, i)
+        if z.dir == dir
+            cnt += 1
+            if oldest == -1
+                oldest := i
+            else if z.born < array.get(zones, oldest).born
+                oldest := i
+    if cnt > maxZones and oldest >= 0
+        box.delete(array.get(zones, oldest).bx)
+        array.remove(zones, oldest)
+
+    if showBubbles
+        bool big = volume >= avgVol * volMult * 1.6
+        label.new(bar_index, dir == 1 ? low : high, str.tostring(volume, format.volume), style = label.style_circle, color = dir == 1 ? color.new(color.green, 55) : color.new(color.red, 55), textcolor = color.white, size = big ? size.normal : size.small)
+
+// Zonen nach rechts mitziehen
+if array.size(zones) > 0
+    for z in zones
+        box.set_right(z.bx, bar_index + 3)
+
+// ─── Signal zeichnen ────────────────────────────────────────────────────────
+if showSig and (longSig or shortSig)
+    bool isL = longSig
+    string t = (isL ? "LONG" : "SHORT") + "\n" + sigWhy + "\nSL " + str.tostring(sigSL, format.mintick) + " · TP " + str.tostring(sigTP, format.mintick)
+    label.new(bar_index, isL ? low : high, t, style = isL ? label.style_label_up : label.style_label_down, color = isL ? color.new(color.green, 10) : color.new(color.red, 10), textcolor = color.white, size = size.small)
+    line.new(bar_index, sigSL, bar_index + 12, sigSL, color = color.red, style = line.style_dashed)
+    line.new(bar_index, sigTP, bar_index + 12, sigTP, color = color.green, style = line.style_dashed)
+
+// ─── Werte für Alerts / Datenfenster ────────────────────────────────────────
+plot(sigEntry, "Entry", color = color.gray, display = display.data_window)
+plot(sigSL, "SL", color = color.red, display = display.data_window)
+plot(sigTP, "TP", color = color.green, display = display.data_window)
+plot(deltaPct * 100, "Delta %", color = color.gray, display = display.data_window)
+
+alertcondition(longSig, "Absorption LONG", 'LONG {{ticker}} · Entry {{plot("Entry")}} · SL {{plot("SL")}} · TP {{plot("TP")}}')
+alertcondition(shortSig, "Absorption SHORT", 'SHORT {{ticker}} · Entry {{plot("Entry")}} · SL {{plot("SL")}} · TP {{plot("TP")}}')
+
+// ─── Status-Anzeige ─────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 1, 1, bgcolor = color.new(color.gray, 85))
+if barstate.islast
+    string mode = cumVol <= 0 ? "Kein Volumen auf diesem Symbol – Indikator inaktiv" : ltfUsed ? "Delta geschätzt aus " + ltf + "-Min-Kerzen" : "Delta geschätzt aus Chart-Kerzen (ungenauer)"
+    table.cell(info, 0, 0, "Apex Absorption · " + mode, text_color = chart.fg_color, text_size = size.small)
