@@ -51,3 +51,8 @@ Weitere Env-Variablen: `ABSORPTION_TF` (Default `5` Minuten), `ABSORPTION_INSTAN
 im `log`-Modus – die Trefferquote der Scalp-Trades **in** einer Gegen-Zone vs. **ohne**.
 Erst wenn „in Gegen-Zone“ über einige Wochen klar schlechter abschneidet, auf `filter` stellen.
 `signal` erst nach eigenem Backtest/Demo.
+
+## Backtest mit echtem Orderflow
+
+Siehe [`backtest/README.md`](backtest/README.md): lädt echte CME-Trades (Databento, Kosten werden vorher angezeigt),
+vergleicht Schätzung vs. echtes Delta vs. Zufall, bevor du für Live-Daten zahlst.

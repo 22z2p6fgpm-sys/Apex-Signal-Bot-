@@ -1,0 +1,2 @@
+databento>=0.60
+pandas>=2.0

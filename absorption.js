@@ -10,6 +10,7 @@
 //  ACHTUNG: Auf CFDs ist "volume" nur Tick-Volumen (Anzahl Preisänderungen),
 //  kein echtes Kauf-/Verkaufsvolumen. Das hier ist eine NÄHERUNG.
 //  Braucht im TradingView-Alert zusätzlich: "open", "volume" (und ideal "time").
+//  Optional "delta" = echtes Kauf- minus Verkaufsvolumen (Futures-Orderflow) → ersetzt die Schätzung.
 // ═══════════════════════════════════════════════════════════════════════════
 'use strict';
 
@@ -44,6 +45,7 @@ function freshState() {
     lastMinute: null,   // Startzeit der zuletzt verarbeiteten 1M-Kerze
     volSeen: 0, volMissing: 0,
     filterChecks: 0, filterHits: 0,
+    realDelta: 0,       // Anzahl 1M-Kerzen mit echtem Delta
   };
 }
 const state = { XAUUSD: freshState(), NDX: freshState() };
@@ -184,7 +186,7 @@ function processBar(st, bar, allowSignal = true) {
 
 // Bei JEDER 1M-Kerze aufrufen. Gibt das Ergebnis der gerade fertig gewordenen
 // TF-Kerze zurück ({bar, atr, newZone, signal, active}) oder null.
-function feed(key, { open, high, low, close, volume, time }) {
+function feed(key, { open, high, low, close, volume, time, delta }) {
   const st = S(key);
   const h = num(high), l = num(low), c = num(close);
   if (![h, l, c].every(Number.isFinite)) return null;
@@ -205,7 +207,10 @@ function feed(key, { open, high, low, close, volume, time }) {
     st.cur = null;
   }
 
-  const d = clvDelta(o, h, l, c, v);
+  // Echtes Delta (Kauf- minus Verkaufs-Aggressor-Volumen, z. B. aus CME-Trades) hat Vorrang vor der Schätzung
+  const dReal = num(delta);
+  const d = Number.isFinite(dReal) ? Math.max(-v, Math.min(v, dReal)) : clvDelta(o, h, l, c, v);
+  if (Number.isFinite(dReal)) st.realDelta++;
   if (!st.cur) st.cur = { bucket, o, h, l, c, v, d, ts: bucket * TF_MS };
   else { st.cur.h = Math.max(st.cur.h, h); st.cur.l = Math.min(st.cur.l, l); st.cur.c = c; st.cur.v += v; st.cur.d += d; }
 
@@ -252,7 +257,7 @@ function describe(key) {
     return L;
   }
   const atr = atrOf(st.bars, CFG.ATR_LEN);
-  L.push('aktiv · ' + st.bars.length + ' ' + CFG.TF_MIN + 'M-Kerzen · ATR ' + (atr ? atr.toFixed(2) : 'Warmup') + ' · Filter ' + st.filterHits + '/' + st.filterChecks + ' geblockt');
+  L.push('aktiv · Delta ' + (st.realDelta > 0 ? 'ECHT' : 'geschätzt') + ' · ' + st.bars.length + ' ' + CFG.TF_MIN + 'M-Kerzen · ATR ' + (atr ? atr.toFixed(2) : 'Warmup') + ' · Filter ' + st.filterHits + '/' + st.filterChecks + ' geblockt');
   const res = st.zones.filter(z => z.dir === -1).sort((a, b) => a.bot - b.bot);
   const sup = st.zones.filter(z => z.dir === 1).sort((a, b) => b.top - a.top);
   L.push('Widerstand: ' + (res.length ? res.map(z => z.bot + '–' + z.top + ' (' + z.vol + '|' + z.dPct + '%' + (z.used ? ',genutzt' : '') + ')').join(' · ') : '–'));
@@ -274,11 +279,13 @@ function setState(s) {
     const st = freshState();
     if (Array.isArray(src.bars)) st.bars = src.bars.filter(b => b && Number.isFinite(b.h) && Number.isFinite(b.l)).slice(-CFG.MAX_BARS);
     if (Array.isArray(src.zones)) st.zones = src.zones.filter(z => z && Number.isFinite(z.top) && Number.isFinite(z.bot));
-    for (const f of ['seq', 'prevClose', 'lastMinute', 'volSeen', 'volMissing', 'filterChecks', 'filterHits']) if (Number.isFinite(src[f])) st[f] = src[f];
+    for (const f of ['seq', 'prevClose', 'lastMinute', 'volSeen', 'volMissing', 'filterChecks', 'filterHits', 'realDelta']) if (Number.isFinite(src[f])) st[f] = src[f];
     if (src.cur && Number.isFinite(src.cur.bucket)) st.cur = src.cur;
     if (src.lastSignal) st.lastSignal = src.lastSignal;
     state[k] = st;
   }
 }
 
-module.exports = { feed, blocks, describe, active, zonesFor, getState, setState, CFG, _clvDelta: clvDelta };
+function reset(key) { state[key] = freshState(); }
+
+module.exports = { feed, blocks, describe, active, zonesFor, getState, setState, reset, CFG, _clvDelta: clvDelta };
