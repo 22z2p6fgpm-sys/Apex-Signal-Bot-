@@ -8,6 +8,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const broker = require('./broker'); // MetaApi (MT5) Ausführungs-Schicht
+const absorption = require('./absorption'); // Orderflow-Näherung (Absorptions-Zonen)
 
 const TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID || "-5280319758";
@@ -29,6 +30,14 @@ const CONFIG = {
   // Opening-Range-Breakout (15:45) — standardmäßig AUS (~20% Trefferquote, verlässlich rot).
   // Zum Wieder-Anschalten: Railway-Env ENABLE_OPENING_RANGE=true setzen.
   ENABLE_OPENING_RANGE: process.env.ENABLE_OPENING_RANGE === 'true',
+  // Absorptions-Zonen (Orderflow-Näherung, siehe absorption.js). Railway-Env ABSORPTION_MODE:
+  //   off    = komplett aus
+  //   log    = nur beobachten: Zonen + "würde blocken" in Logs/Diag, KEIN Einfluss aufs Trading (Standard)
+  //   filter = Scalp-Signale blocken, die direkt in eine Gegen-Zone laufen
+  //   signal = filter + eigene Absorptions-Trades (Retest einer Zone)
+  // Braucht "open" + "volume" (ideal auch "time") in der TradingView-Alert-Nachricht.
+  ABSORPTION_MODE: ['off', 'log', 'filter', 'signal'].includes((process.env.ABSORPTION_MODE || '').toLowerCase())
+    ? process.env.ABSORPTION_MODE.toLowerCase() : 'log',
   TRADE_TIMEOUT_MIN: 240, // 4h
   RSI_BUY: [45, 65],
   RSI_SELL: [35, 55],
@@ -633,6 +642,7 @@ function recordClose(trade, exitPrice, reason) {
     symbol: getAssetLabel(trade.symbol), signal: trade.signal, type: trade.type,
     grade: trade.grade || null, entry: trade.entry, exit: parseFloat(Number(exitPrice).toFixed(2)),
     reason, result, pnl: parseFloat(money.toFixed(1)), pips: parseFloat(pips.toFixed(1)), lot: trade.lot || null,
+    absWarn: trade.absWarn != null ? trade.absWarn : null,   // Scalp lief in eine Absorptions-Gegen-Zone (Auswertung log-Modus)
   });
   if (tradeHistory.length > 3000) tradeHistory.shift();
 }
@@ -666,7 +676,7 @@ async function checkOpenTrades(symbol, high, low) {
     if (trade.symbol !== symbol) { remaining.push(trade); continue; }
 
     const isBuy = trade.signal === 'BUY';
-    const tl = trade.type === 'opening_range' ? 'Range' : trade.type === 'swing' ? 'Swing' : 'Scalp';
+    const tl = trade.type === 'opening_range' ? 'Range' : trade.type === 'swing' ? 'Swing' : trade.type === 'absorption' ? 'Absorption' : 'Scalp';
     const reached = (level) => isBuy ? high >= level : low <= level;
 
     if (!trade.tp1Hit && reached(trade.tp1)) {
@@ -898,6 +908,24 @@ RSI ${Math.round(parseFloat(rsi))} · MACD ${macd} · R:R 1:${rr}
 _${getBerlinTime().slice(0,5)} · Apex_`;
 }
 
+function buildAbsorptionSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, why, zoneBot, zoneTop, zoneVol, lot) {
+  const emoji = signal === 'BUY' ? '🟢' : '🔴';
+  const zoneLine = (zoneBot != null && zoneTop != null)
+    ? `\nZone ${zoneBot.toFixed(2)}–${zoneTop.toFixed(2)} · Vol ${zoneVol}`
+    : (zoneVol ? `\nAbsorptions-Kerze · Vol ${zoneVol}` : '');
+  return `${emoji} *${signal} · ${asset}*
+Absorption · ${why}${lot ? ` · ${lot} Lot` : ''}
+
+${block([
+  prow('Entry', entry),
+  prow('SL', sl),
+  prow('TP1', tp1, rLabel(entry, sl, tp1)),
+  prow('TP2', tp2, rLabel(entry, sl, tp2)),
+  prow('TP3', tp3, rLabel(entry, sl, tp3)),
+])}${zoneLine}
+_Orderflow-Näherung (Tick-Volumen) · ${getBerlinTime().slice(0,5)} · Apex_`;
+}
+
 function buildSwingSignalMsg(signal, asset, entry, sl, tp1, tp2, tp3, rr, rsi, trend, lot) {
   const emoji = signal === 'BUY' ? '🟢' : '🔴';
   return `${emoji} *${signal} · ${asset}*
@@ -938,7 +966,7 @@ function buildWeeklyReport() {
   const wr = (w + l) > 0 ? Math.round(w / (w + l) * 100) : 0;
 
   const bySymbol = ['XAU/USD', 'NASDAQ 100'].map(sym => statLine(sym === 'XAU/USD' ? 'Gold' : 'NASDAQ', wk.filter(t => t.symbol === sym))).filter(Boolean);
-  const byType = [['4confirm','Scalp'], ['swing','Swing'], ['opening_range','Range']].map(([k, lbl]) => statLine(lbl, wk.filter(t => t.type === k))).filter(Boolean);
+  const byType = [['4confirm','Scalp'], ['swing','Swing'], ['opening_range','Range'], ['absorption','Absorption']].map(([k, lbl]) => statLine(lbl, wk.filter(t => t.type === k))).filter(Boolean);
   const byGrade = ['A+','A','B','C'].map(g => statLine('Grade '+g, wk.filter(t => t.grade === g))).filter(Boolean);
   const byReason = ['TP3','Trailing','BE','SL','Timeout'].map(r => statLine(r, wk.filter(t => t.reason === r))).filter(Boolean);
   const byDay = ['Mo','Di','Mi','Do','Fr'].map((lbl, i) => statLine(lbl, wk.filter(t => t.weekday === i + 1))).filter(Boolean);
@@ -1240,6 +1268,19 @@ function buildDiag() {
   if (tradeHistory.length) tradeHistory.slice(-8).reverse().forEach(t => L.push(t.date + ' ' + t.signal + ' ' + t.symbol + ' ' + t.type + ' → ' + t.reason + ' ' + (t.pnl >= 0 ? '+' : '') + t.pnl + '€ (' + t.result + ')'));
   else L.push('(keine)');
   L.push('');
+  L.push('-- Absorption (Modus ' + CONFIG.ABSORPTION_MODE.toUpperCase() + ', ' + absorption.CFG.TF_MIN + 'M) --');
+  if (CONFIG.ABSORPTION_MODE === 'off') L.push('aus');
+  else {
+    for (const k of ['XAUUSD', 'NDX']) absorption.describe(k).forEach((line, i) => L.push((i === 0 ? getAssetLabel(k) + ': ' : '  ') + line));
+    // Auswertung: Scalp-Trades, die in eine Gegen-Zone liefen (absWarn) vs. der Rest
+    const tagged = tradeHistory.filter(t => t.type === '4confirm' && t.absWarn != null);
+    const wr = (arr) => { const w = arr.filter(t => t.result === 'WIN').length, l = arr.filter(t => t.result === 'LOSS').length; const pnl = arr.reduce((s, t) => s + (t.pnl || 0), 0); return (w + l ? Math.round(w / (w + l) * 100) + '%' : '–') + ' WR · ' + arr.length + ' Trades · ' + (pnl >= 0 ? '+' : '') + pnl.toFixed(0) + '€'; };
+    if (tagged.length) {
+      L.push('Scalp IN Gegen-Zone: ' + wr(tagged.filter(t => t.absWarn)));
+      L.push('Scalp ohne Gegen-Zone: ' + wr(tagged.filter(t => !t.absWarn)));
+    }
+  }
+  L.push('');
   L.push('-- Config --');
   L.push('Opening-Range ' + (CONFIG.ENABLE_OPENING_RANGE ? 'AN' : 'AUS') + ' · Cooldown ' + CONFIG.COOLDOWN_MIN + 'min · Bias-Filter ' + CONFIG.REQUIRE_BIAS_ALIGN + ' · MAX_CANDLES ' + CONFIG.MAX_CANDLES);
   L.push('=== ENDE ===');
@@ -1249,7 +1290,7 @@ function buildDiag() {
 function saveState() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent, pauseUntil, sessionData, dailyFlags, propConfig, lotConfig };
+    const state = { v: 1, savedAt: Date.now(), store, swingStore, swingBuilder, openTrades, lastTradeTime, tradeHistory, weeklyLastSent: weeklyReport.lastSent, pauseUntil, sessionData, dailyFlags, propConfig, lotConfig, absorption: absorption.getState() };
     fs.writeFileSync(STATE_FILE, JSON.stringify(state));
   } catch (e) {
     console.warn('⚠️ State speichern fehlgeschlagen (Volume auf /data gemountet?):', e.message);
@@ -1286,6 +1327,7 @@ function loadState() {
     if (s.lotConfig) Object.assign(lotConfig, s.lotConfig);
     if (s.sessionData) for (const k of ['XAUUSD', 'NDX']) { if (s.sessionData[k]) Object.assign(sessionData[k], s.sessionData[k]); }
     if (s.dailyFlags) Object.assign(dailyFlags, s.dailyFlags);
+    if (s.absorption) absorption.setState(s.absorption);
     const age = s.savedAt ? Math.round((Date.now() - s.savedAt) / 1000) : '?';
     console.log(`✅ State geladen: ${store['XAUUSD'].closes.length}/${store['NDX'].closes.length} Scalp-Kerzen · ${swingStore['XAUUSD'].closes.length}/${swingStore['NDX'].closes.length} Swing-Kerzen · ${openTrades.length} offene Trades · ${tradeHistory.length} Trades in Historie (vor ${age}s gesichert)`);
   } catch (e) {
@@ -2184,6 +2226,25 @@ const server = http.createServer((req, res) => {
         // 0. Offene Trades prüfen (TP/SL/Timeout)
         await checkOpenTrades(normSym, high, low);
 
+        // 0b. Absorptions-Zonen fortschreiben (braucht open/volume im Alert; sonst inaktiv)
+        let absRes = null;
+        if (CONFIG.ABSORPTION_MODE !== 'off' && sessionKey && !isSwing(symbol)) {
+          try {
+            absRes = absorption.feed(sessionKey, { open: data.open, high, low, close, volume: data.volume, time: data.time });
+            if (absRes && absRes.active && absRes.newZone) {
+              const z = absRes.newZone;
+              console.log(`🧱 Absorption ${assetLabel}: ${z.dir === 1 ? 'Unterstützung' : 'Widerstand'} ${z.bot}–${z.top} (Vol ${z.vol} | ${z.dPct}%)`);
+            }
+            if (absRes && absRes.signal) {
+              const a = absRes.signal;
+              console.log(`🎯 Absorption-Signal ${assetLabel}: ${a.signal} ${a.why} @ ${a.entry} SL ${a.sl} TP ${a.tp}${CONFIG.ABSORPTION_MODE === 'signal' ? '' : ' (nur Log)'}`);
+            }
+          } catch (e) {
+            console.warn('⚠️ Absorption-Modul Fehler:', e.message);
+            absRes = null;
+          }
+        }
+
         // ─── SWING 1H aus dem 1M-Feed (Weg 2) ───────────────────────────
         // Läuft nur für echte 1M-Scalp-Feeds, nicht für evtl. Alt-_SWING-Alerts.
         if (!isSwing(symbol) && sessionKey) {
@@ -2310,6 +2371,34 @@ const server = http.createServer((req, res) => {
           }
         }
 
+        // 4c. Absorptions-Trade (nur ABSORPTION_MODE=signal) — Retest einer Zone, Ziel = Gegen-Zone
+        if (CONFIG.ABSORPTION_MODE === 'signal' && absRes && absRes.signal && sessionKey && !hasOpenTrade(normSym) && !inCooldown(normSym)) {
+          const a = absRes.signal;
+          const sigKey = `ABS-${a.signal}-${Math.round(a.entry)}`;
+          const dir = a.signal === 'BUY' ? 1 : -1;
+          const risk = Math.abs(a.entry - a.sl);
+          if (st.lastSignal !== sigKey && risk > 0) {
+            st.lastSignal = sigKey;
+            const entry = a.entry, sl = a.sl, tp3 = a.tp;
+            const tp1 = parseFloat((entry + dir * risk).toFixed(2));              // 1R
+            const tp2 = parseFloat(((tp1 + tp3) / 2).toFixed(2));                  // Mitte 1R ↔ Ziel
+            const rr = (Math.abs(tp3 - entry) / risk).toFixed(2);
+            const atr1m = atrCalc(st.closes, st.highs, st.lows) || risk;
+            const abTrade = { symbol: normSym, signal: a.signal, entry, sl, tp1, tp2, tp3, rr, atr: atr1m, type: 'absorption', grade: null, openedAt: Date.now() };
+            openTrades.push(abTrade);
+            const abEx = tradingPaused()
+              ? { positionId: 'DRY-' + Date.now(), brokerEntry: entry }   // Pause: nur tracken
+              : await broker.openTrade({ sessionKey, signal: a.signal, entry, sl, tp: tp3, type: 'absorption', tag: normSym, ...sizingFor(sessionKey, 'absorption') });
+            if (abEx) { abTrade.positionId = abEx.positionId; abTrade.brokerEntry = abEx.brokerEntry; abTrade.lot = abEx.volume; }
+            await sendTelegram(buildAbsorptionSignalMsg(a.signal, assetLabel, entry, sl, tp1, tp2, tp3, a.why, a.zoneBot, a.zoneTop, a.zoneVol, abTrade.lot));
+            logSignal({ time: getBerlinTime(), symbol: assetLabel, signal: a.signal, type: 'Absorption', grade: null, entry });
+            lastTradeTime[normSym] = Date.now();
+            console.log(`${a.signal === 'BUY' ? '🟢' : '🔴'} Absorption-Trade: ${a.signal} ${assetLabel} (${a.why})`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: true, signal: a.signal, type: 'absorption', entry }));
+          }
+        }
+
         // 5. 4-Confirm Signal (Scalp) — nur wenn kein offener Trade UND kein Cooldown
         if (!hasOpenTrade(normSym) && !inCooldown(normSym)) {
           const result = runStrategy(st.closes, st.highs, st.lows, sessionKey);
@@ -2320,10 +2409,24 @@ const server = http.createServer((req, res) => {
               && bias !== result.signal;
 
             const signalKey = `${result.signal}-${Math.round(result.cur)}`;
-            if (!biasBlocks && st.lastSignal !== signalKey) {
+            const fresh = !biasBlocks && st.lastSignal !== signalKey;
+
+            // Absorptions-Filter: läuft das Signal direkt in eine Gegen-Zone?
+            // log-Modus: nur markieren (absWarn) → in /diag wird ausgewertet, ob der Filter geholfen hätte.
+            let absReason = null;
+            if (fresh && CONFIG.ABSORPTION_MODE !== 'off' && sessionKey) {
+              try { absReason = absorption.blocks(sessionKey, result.signal, result.cur); } catch (_) { absReason = null; }
+            }
+            const absBlocks = !!absReason && (CONFIG.ABSORPTION_MODE === 'filter' || CONFIG.ABSORPTION_MODE === 'signal');
+
+            if (fresh && absBlocks) {
+              st.lastSignal = signalKey;   // gleiches Setup nicht jede Minute neu loggen
+              console.log(`🧱 ${result.signal} ${assetLabel} blockiert (Absorption: ${absReason})`);
+            } else if (fresh) {
               st.lastSignal = signalKey;
+              if (absReason) console.log(`👀 [Absorption-Log] ${result.signal} ${assetLabel} läuft in Gegen-Zone: ${absReason}`);
               const trend15m = get15MTrend(st.closes, st.highs, st.lows);
-              const scTrade = { symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, atr: result.atr, type: '4confirm', grade: result.grade, openedAt: Date.now() };
+              const scTrade = { symbol: normSym, signal: result.signal, entry: result.cur, sl: result.sl, tp1: result.tp1, tp2: result.tp2, tp3: result.tp3, rr: result.rr, atr: result.atr, type: '4confirm', grade: result.grade, openedAt: Date.now(), absWarn: (CONFIG.ABSORPTION_MODE !== 'off' && sessionKey && absorption.active(sessionKey)) ? !!absReason : null };
               openTrades.push(scTrade);
               const scEx = tradingPaused()
                 ? { positionId: 'DRY-' + Date.now(), brokerEntry: result.cur }   // Pause: nur tracken
